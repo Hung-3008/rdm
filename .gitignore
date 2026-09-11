@@ -1,0 +1,22 @@
+# data, outputs, checkpoints, papers: never committed
+data/
+outputs/
+results/
+checkpoints/
+references/
+docs/
+wandb/
+logs/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.parquet
+# python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/

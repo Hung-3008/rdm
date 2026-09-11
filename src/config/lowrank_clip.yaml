@@ -1,0 +1,27 @@
+# Low-rank basis encoder (docs/propose/propose01.md), CLIP ViT-B/16 features, held-out S1,
+# slow stage trained on S2/S5/S7. K was selected by nested leave-one-training-subject-out
+# (scripts/propose01_sweep.sh); early stopping uses val_images per training subject.
+seed: 0
+out_dir: outputs/propose01/lowrank_s1
+
+data:
+  source:
+    name: npy_multisubj
+    data_dir: data/braincorl/clip_b16
+    train_subjects: [2, 5, 7]
+    val_subjects: [2]      # unused by train_lowrank (it holds out images, not subjects)
+
+basis:
+  hidden_dim: 512
+  basis_dim: 16          # selected on the nested held-out subjects (propose01.md 6.1)
+  lr: 1.0e-3
+  head_weight_decay: 1.0e-4
+  batch_size: 512
+  max_epochs: 200
+  patience: 10
+  val_images: 500        # held-out unique images per training subject (seeded)
+
+fast:
+  lambdas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]
+  tau2: 1.0e-3           # PopEB kernel bandwidth; nested leave-one-training-subject-out (propose01.md 9.2)
+  lam0: 1.0              # PopEB ridge for the support estimate and its LOO noise variance

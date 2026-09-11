@@ -1,0 +1,34 @@
+# Stage 3: supervised fine-tuning on real NSD betas (train S2/S5/S7, held-out S1),
+# context ~ U(0, 500). lr / wd / dropout follow the original train.sh.
+seed: 0
+out_dir: outputs/scratch/MODEL/stage3_s1
+data:
+  source:
+    name: npy_multisubj
+    data_dir: data/braincorl/clip_b16
+    train_subjects: [2, 5, 7]
+    val_subjects: [2, 5, 7]
+    with_coords: true
+  batch_size: 64
+  max_in_context: 500
+  max_query: 100
+  num_workers: 8
+module:
+  model: {name: braincorl, preset: CLIP, num_layers: 20, ffn_hidden_dim: 2048, num_heads: 10, num_reg_tokens: 4, dropout: 0.5}
+  loss: {name: pmse}
+  val_loss: {name: weight_cos_l2, lambda_l2: 1.0}
+  min_in_context: 0
+  max_in_context: 500
+  lr: 1.0e-4
+  weight_decay: 0.1
+  warmup_steps: 500
+  init_weights: INIT
+trainer:
+  max_epochs: 30
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  limit_val_batches: 0.25
+  checkpoint: {monitor: val_expl_var, mode: max, save_top_k: 2}
+  early_stopping_patience: 5
