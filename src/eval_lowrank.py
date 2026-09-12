@@ -76,7 +76,7 @@ def main():
     true = torch.from_numpy(bundle.query_beta.T).to(device)         # (V, Q)
     q_img = torch.from_numpy(bundle.query_img).to(device)
 
-    C0, Cpop, spatial, F_stats = None, None, None, None
+    C0, Cpop, spatial, F_stats, xyz_v = None, None, None, None, None
     if args.prior_sigma or args.popeb:
         src = cfg["data"]["source"]
         data_dir = Path(src["data_dir"])
@@ -101,13 +101,14 @@ def main():
             Cpop = torch.from_numpy(np.concatenate(pop, 1)).to(device)
             if fcfg.tau2_ratio > 0:
                 fcfg.tau2 = float(fcfg.tau2_ratio * Cpop.var(1).mean().item())
-            if fcfg.spatial_sigma:
+            if fcfg.spatial_sigma or fcfg.match_sigma:
                 xyz_v = torch.from_numpy(np.load(data_dir / f"s{args.subject}_coords.npy").astype(np.float32)).to(device)
+            if fcfg.spatial_sigma:
                 spatial = (xyz_v, torch.from_numpy(np.concatenate(pop_xyz, 0)).to(device), fcfg.spatial_sigma)
             if fcfg.std_global:
                 F_stats = feature_stats(basis, imgs, device)
             print(f"[popeb] population: {Cpop.shape[1]} voxels from subjects {src['train_subjects']}, tau2={fcfg.tau2}, "
-                  f"lam0={fcfg.lam0}, spatial_sigma={fcfg.spatial_sigma}, std_global={fcfg.std_global}")
+                  f"lam0={fcfg.lam0}, spatial_sigma={fcfg.spatial_sigma}, std_global={fcfg.std_global}, match_sigma={fcfg.match_sigma}")
 
     rows, cmp_rows, start = [], [], 0
     for num_ic in args.num_ic:
@@ -122,7 +123,7 @@ def main():
                 preds["lowrank_prior"] = predict_lowrank(ic_img, ic_beta, q_img, basis, fcfg, C0=C0)
             if Cpop is not None:
                 preds["lowrank_popeb"] = predict_lowrank(ic_img, ic_beta, q_img, basis, fcfg, Cpop=Cpop,
-                                                         spatial=spatial, F_stats=F_stats)
+                                                         spatial=spatial, F_stats=F_stats, xyz_v=xyz_v)
             if args.ridge:
                 preds["ridge"] = (predict_ridge(bundle.ic_img[idx], bundle.ic_beta[idx], bundle.query_img, device)[0], {})
 

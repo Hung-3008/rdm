@@ -85,12 +85,26 @@ class LowRankConfig:
     lam0: float = 1.0       # PopEB ridge for the support estimate C_hat and its LOO noise variance
     spatial_sigma: float = 0.0   # PopEB: Gaussian weighting of population voxels by MNI distance (mm); 0 = off
     std_global: bool = False     # PopEB: standardise basis features with pooled training-subject statistics
+    match_sigma: float = 0.0     # PopEB: population weights computed from C_hat smoothed over the new subject's
+                                 # neighbouring voxels (Gaussian, mm); the posterior keeps the voxel's own C_hat. 0 = off
+
+
+@torch.inference_mode()
+def smooth_over_voxels(C: torch.Tensor, xyz: torch.Tensor, sigma: float, chunk: int = 1024) -> torch.Tensor:
+    """Gaussian (sigma mm) weighted average of C (K, V) over the voxels xyz (V, 3) of the same subject."""
+    out = torch.empty_like(C)
+    pn = (xyz ** 2).sum(1)
+    for a in range(0, xyz.shape[0], chunk):
+        xv = xyz[a:a + chunk]
+        d2 = (xv ** 2).sum(1, keepdim=True) - 2 * xv @ xyz.T + pn[None, :]
+        out[:, a:a + chunk] = (torch.softmax(-0.5 * d2 / sigma ** 2, 1) @ C.T).T
+    return out
 
 
 @torch.inference_mode()
 def popeb(F: torch.Tensor, B: torch.Tensor, Cpop: torch.Tensor, tau2: float, lam0: float = 1.0,
           spatial: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
-          chunk: int = 512) -> torch.Tensor:
+          chunk: int = 512, match_smooth: Optional[Tuple[torch.Tensor, float]] = None) -> torch.Tensor:
     """PopEB: posterior-mean coefficients under a population kernel prior.
     F (n, K) standardised design, B (n, V) centred targets, Cpop (K, J) full-data coefficients of
     the training subjects' voxels in the same standardised basis.
@@ -102,7 +116,10 @@ def popeb(F: torch.Tensor, B: torch.Tensor, Cpop: torch.Tensor, tau2: float, lam
     i.e. per-voxel ridge with lambda_v = sig2_v/tau2 toward a softmax-weighted population mean.
     spatial = (xyz_v (V, 3), xyz_pop (J, 3), sigma_mm): w_vj additionally ∝ exp(-|xyz_v - xyz_j|^2 / 2 sigma^2)
     (propose01.md 9.6). The precision (sig2 G^-1 + tau2 I)^-1 is formed as (sig2 I + tau2 G)^-1 G so
-    that K >= n (singular G) is handled. Returns m (K, V)."""
+    that K >= n (singular G) is handled.
+    match_smooth = (xyz_v (V, 3), sigma_mm): the weights w_vj use C_hat averaged over the new subject's
+    neighbouring voxels (docs/results.md E18); the likelihood term keeps the voxel's own C_hat.
+    Returns m (K, V)."""
     n, K = F.shape
     G = F.T @ F
     evals, Q = torch.linalg.eigh(G)
@@ -111,6 +128,7 @@ def popeb(F: torch.Tensor, B: torch.Tensor, Cpop: torch.Tensor, tau2: float, lam
     h = ((FQ ** 2) * inv).sum(1)
     Chat = Q @ (inv[:, None] * (FQ.T @ B))                                  # (K, V)
     sig2 = (((B - F @ Chat) / (1.0 - h)[:, None]) ** 2).mean(0)             # (V,)
+    Cmatch = Chat if match_smooth is None else smooth_over_voxels(Chat, match_smooth[0], match_smooth[1])
     I = torch.eye(K, device=F.device)
     CC = (Cpop[:, None, :] * Cpop[None, :, :]).reshape(K * K, -1)           # (K*K, J) outer products
     if spatial is not None:
@@ -119,7 +137,7 @@ def popeb(F: torch.Tensor, B: torch.Tensor, Cpop: torch.Tensor, tau2: float, lam
     out = torch.empty_like(Chat)
     for a in range(0, Chat.shape[1], chunk):
         s2 = sig2[a:a + chunk]
-        c = Chat[:, a:a + chunk].T                                          # (v, K)
+        c = Cmatch[:, a:a + chunk].T                                        # (v, K), weights only
         M = torch.linalg.solve(s2[:, None, None] * I[None] + (tau2 * G)[None], G[None].expand(len(s2), K, K))
         cM = torch.einsum("vi,vij->vj", c, M)
         logits = -0.5 * ((cM * c).sum(1, keepdim=True) - 2 * cM @ Cpop + M.reshape(len(s2), -1) @ CC)   # (v, J)
@@ -128,7 +146,7 @@ def popeb(F: torch.Tensor, B: torch.Tensor, Cpop: torch.Tensor, tau2: float, lam
             logits = logits - 0.5 * ((xv ** 2).sum(1, keepdim=True) - 2 * xv @ xyz_p.T + pn[None, :]) / sigma ** 2
         Cbar = torch.softmax(logits, 1) @ Cpop.T                            # (v, K)
         A = G[None] / s2[:, None, None] + I[None] / tau2
-        rhs = (G @ c.T).T / s2[:, None] + Cbar / tau2
+        rhs = (G @ Chat[:, a:a + chunk]).T / s2[:, None] + Cbar / tau2
         out[:, a:a + chunk] = torch.linalg.solve(A, rhs[:, :, None])[:, :, 0].T
     return out
 
@@ -139,12 +157,14 @@ def predict_lowrank(ic_img: torch.Tensor, ic_beta: torch.Tensor, q_img: torch.Te
                     C0: Optional[torch.Tensor] = None,
                     Cpop: Optional[torch.Tensor] = None,
                     spatial: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
-                    F_stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
+                    F_stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                    xyz_v: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
     """ic_img (n, E), ic_beta (n, V), q_img (q, E) on one device; optional prior mean C0 (K, V) or
     PopEB population coefficients Cpop (K, J) (mutually exclusive; the combination is untested).
     spatial (PopEB only): (xyz of the new subject's voxels, xyz of the population voxels, sigma mm).
     F_stats: (mean, std) of the basis features used for standardisation instead of the support's own
-    (propose01.md 9.6: pooled statistics of the training subjects). Returns pred (V, q) and diagnostics."""
+    (propose01.md 9.6: pooled statistics of the training subjects). xyz_v (V, 3): the new subject's MNI
+    coordinates, needed when cfg.match_sigma > 0. Returns pred (V, q) and diagnostics."""
     B_mean = ic_beta.mean(0, keepdim=True)
     F_sup, F_q = basis(ic_img), basis(q_img)
     if F_stats is None:
@@ -155,7 +175,8 @@ def predict_lowrank(ic_img: torch.Tensor, ic_beta: torch.Tensor, q_img: torch.Te
     if Cpop is not None:
         if C0 is not None:
             raise ValueError("C0 and Cpop together are untested; pass one of them")
-        C = popeb(F_n, ic_beta - B_mean, Cpop, cfg.tau2, cfg.lam0, spatial=spatial)
+        ms = (xyz_v, cfg.match_sigma) if cfg.match_sigma > 0 else None
+        C = popeb(F_n, ic_beta - B_mean, Cpop, cfg.tau2, cfg.lam0, spatial=spatial, match_smooth=ms)
         return (B_mean + ((F_q - F_mean) / F_std) @ C).T, dict(tau2=cfg.tau2)
     target = ic_beta - B_mean if C0 is None else ic_beta - B_mean - F_n @ C0
     C, lam = ridge_loo(F_n, target, cfg.lambdas)
