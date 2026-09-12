@@ -106,7 +106,10 @@ def stage_betas(nsd: Path, out: Path, subj: int):
     sums = np.zeros((10000, V), np.float64)
     counts = np.zeros(10000, np.int32)
     bdir = nsd / "nsddata_betas/ppdata" / f"subj{subj:02d}/func1pt8mm" / BETAS_DIR
-    for sess in tqdm(range(1, N_SESSIONS + 1), desc=f"[betas] s{subj}"):
+    # subjects 3/6 have 32 sessions and 4/8 have 30 (others 40): use the sessions that exist
+    n_sess = sum((bdir / f"betas_session{k:02d}.hdf5").exists() or (bdir / f"betas_session{k:02d}.nii.gz").exists()
+                 for k in range(1, N_SESSIONS + 1))
+    for sess in tqdm(range(1, n_sess + 1), desc=f"[betas] s{subj} ({n_sess} sessions)"):
         h5 = bdir / f"betas_session{sess:02d}.hdf5"
         if h5.exists():
             with h5py.File(h5) as f:
@@ -120,12 +123,17 @@ def stage_betas(nsd: Path, out: Path, subj: int):
         trials = master[(sess - 1) * TRIALS_PER_SESSION: sess * TRIALS_PER_SESSION]
         np.add.at(sums, trials, b)
         np.add.at(counts, trials, 1)
-    if (counts == 0).any():
-        raise RuntimeError(f"s{subj}: {(counts == 0).sum()} images never shown")
-    betas = (sums / counts[:, None]).astype(np.float32)          # (10000, V) in subjectim order
+    shown = counts > 0
+    if not shown.all():
+        # subjects with < 40 sessions: unique images never shown are dropped; common images never shown
+        # are kept as NaN rows so that the 1,000-image common order stays identical across subjects
+        print(f"[betas] s{subj}: {(~shown).sum()} of 10000 images never shown ({n_sess} sessions); "
+              f"dropping them from the unique set, NaN in the common set")
+    betas = np.full((10000, V), np.nan, np.float32)
+    betas[shown] = (sums[shown] / counts[shown, None]).astype(np.float32)   # (10000, V) in subjectim order
 
     is_shared = np.isin(subjectim, sharedix)
-    uniq = np.flatnonzero(~is_shared)
+    uniq = np.flatnonzero(~is_shared & shown)
     # common set in sharedix order so that one feature file serves every subject
     common = np.array([np.flatnonzero(subjectim == n)[0] for n in sharedix])
     np.save(out / f"s{subj}_betas_unique.npy", betas[uniq])
@@ -178,7 +186,7 @@ def stage_gt(out: Path, subj: int, backbone: str, device: str):
     from ..utils import ridge_cv_brainwise, unit_norm
     feats = np.load(out / f"feats_{backbone}_73k.npy", mmap_mode="r")
     X = torch.from_numpy(unit_norm(np.asarray(feats[np.load(out / f"s{subj}_nsdid_unique.npy")]))).to(device)
-    y = torch.from_numpy(np.load(out / f"s{subj}_betas_unique.npy").T.copy()).to(device)   # (V, 9000)
+    y = torch.from_numpy(np.load(out / f"s{subj}_betas_unique.npy").T.copy()).to(device)   # (V, n_unique)
     gt = []
     for i in tqdm(range(0, y.shape[0], 4096), desc=f"[gt] s{subj}"):
         gt.append(ridge_cv_brainwise(X, y[i:i + 4096]).cpu().numpy())
@@ -188,7 +196,8 @@ def stage_gt(out: Path, subj: int, backbone: str, device: str):
     Xc = unit_norm(np.asarray(feats[np.load(out / f"s{subj}_nsdid_common.npy")]))
     pred = np.c_[Xc, np.ones(len(Xc), np.float32)] @ gt.T
     yc = np.load(out / f"s{subj}_betas_common.npy")
-    ev = 1 - np.var(yc - pred, 0) / np.var(yc, 0)
+    ok = ~np.isnan(yc[:, 0])                                     # common images actually shown to this subject
+    ev = 1 - np.var(yc[ok] - pred[ok], 0) / np.var(yc[ok], 0)
     print(f"[gt] s{subj}: {gt.shape}, EV on common images: mean {ev.mean():.4f}, "
           f"mean over ncsnr>0.2 {ev[np.load(out / f's{subj}_voxel_meta.npz')['ncsnr'] > 0.2].mean():.4f}")
 
@@ -220,9 +229,12 @@ def stage_layout(out: Path, subjects, backbone: str, seed: int):
             np.save(lay / f"s{s}_coords.npy", np.load(out / f"s{s}_coords_mni.npy"))
             np.save(lay / f"s{s}_coords_val.npy", np.load(out / f"s{s}_coords_mni.npy"))
     np.save(lay / "common_img_feats_normed.npy", unit_norm(np.asarray(feats[common_ids])).astype(np.float32))
-    order = np.random.default_rng(seed).permutation(9000).tolist()
-    with open(lay / "test_time_icl_idx.json", "w") as f:
-        json.dump({"large_shuffled": order}, f)
+    # support ordering over the 9,000 unique images of the 40-session subjects; never overwritten once
+    # created (subjects with fewer unique images are population-only, not evaluation subjects)
+    if not (lay / "test_time_icl_idx.json").exists():
+        order = np.random.default_rng(seed).permutation(9000).tolist()
+        with open(lay / "test_time_icl_idx.json", "w") as f:
+            json.dump({"large_shuffled": order}, f)
     print(f"[layout] wrote {lay}")
 
 
