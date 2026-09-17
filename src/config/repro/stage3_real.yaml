@@ -1,0 +1,37 @@
+# BraInCoRL reproduction, stage 3: supervised fine-tuning on real NSD betas, hyperparameters from the released
+# train.sh (batch 64, lr 1e-4, wd 0.1, dropout 0.5, loss pmse, context U(30, 500), 100 query images, 100 epochs,
+# ReduceLROnPlateau on val loss) and the paper (early stopping on val loss, patience 5). Validation = the
+# training subjects' shared-image betas (original val_subj = train_subj). Deviations: 1 GPU, bf16 instead of
+# 16-mixed FSDP; gradient clipping 1.0 added as a safeguard (original has none). DATA / INIT set by scripts/repro_braincorl.sh.
+seed: 0
+out_dir: outputs/repro/stage3
+data:
+  source:
+    name: npy_multisubj
+    data_dir: DATA
+    train_subjects: [2, 5, 7]
+    val_subjects: [2, 5, 7]
+  batch_size: 64
+  max_in_context: 500
+  max_query: 100
+  num_workers: 8
+module:
+  model: {name: braincorl, preset: CLIP, num_layers: 20, ffn_hidden_dim: 2048, num_heads: 10, num_reg_tokens: 4, dropout: 0.5}
+  loss: {name: pmse}
+  val_loss: {name: weight_cos_l2, lambda_l2: 1.0}
+  min_in_context: 30
+  max_in_context: 500
+  lr: 1.0e-4
+  weight_decay: 0.1
+  warmup_steps: 0
+  init_weights: INIT
+trainer:
+  max_epochs: 100
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  limit_val_batches: 0.25
+  checkpoint: {monitor: val_expl_var, mode: max, save_top_k: 2}
+  early_stopping_patience: 5
+  early_stopping_monitor: val_loss

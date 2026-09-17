@@ -25,7 +25,7 @@ from .dataset import SOURCES
 from .engine import IclLightningModule
 from .model import build_model
 from .model.checkpoint import load_original_checkpoint
-from .utils import explained_variance, normed_cos_similarity, point_mse, ridge_cv_brainwise
+from .utils import explained_variance, normed_cos_similarity, pearson, point_mse, ridge_cv_brainwise
 
 
 class VoxelEvalDataset(Dataset):
@@ -64,10 +64,11 @@ def predict_ridge(ic_img, ic_beta, q_img, device):
 
 
 def roi_masks(voxel_meta):
-    """ROI masks from s{N}_voxel_meta.npz (floc label>0, t>2, ncsnr>0.2) as in BraInCoRL Table 1."""
+    """ROI masks from s{N}_voxel_meta.npz (floc label>0, t>2, ncsnr>0.2) as in BraInCoRL Table 1,
+    plus "all" (every voxel of the set, no ncsnr filter)."""
     meta = np.load(voxel_meta)
     good = meta["ncsnr"] > 0.2
-    rois = {}
+    rois = {"all": np.ones(len(good), bool)}
     for c in ["faces", "places", "bodies", "words"]:
         rois[c] = (meta[f"floc_{c}_label"] > 0) & (meta[f"floc_{c}_tval"] > 2) & good
     rois["ncsnr>0.2"] = good
@@ -77,7 +78,7 @@ def roi_masks(voxel_meta):
 def score(pred, weights, q_beta, gt, device):
     true = torch.from_numpy(q_beta.T).to(device)
     gt_t = torch.from_numpy(gt).to(device)
-    return dict(expl_var=explained_variance(pred, true), pt_mse=point_mse(pred, true),
+    return dict(expl_var=explained_variance(pred, true), pearson=pearson(pred, true), pt_mse=point_mse(pred, true),
                 cos_sim=normed_cos_similarity(weights, gt_t))
 
 
@@ -138,11 +139,13 @@ def main():
 
             for method, (pred, w) in runs.items():
                 m = score(pred, w, bundle.query_beta, bundle.gt, device)
-                ev = m["expl_var"].cpu().numpy()
+                ev, r = m["expl_var"].cpu().numpy(), m["pearson"].cpu().numpy()
                 np.save(out_dir / f"{method}_num_ic={num_ic}_rep={rep}_expl_var.npy", ev)
+                np.save(out_dir / f"{method}_num_ic={num_ic}_rep={rep}_pearson.npy", r)
                 row = dict(method=method, subject=args.subject, ckpt=args.ckpt, coord_mode=args.coord_mode,
                            num_ic=num_ic, rep=rep, **{k: v.mean().item() for k, v in m.items()})
                 row.update({f"ev_{k}": float(ev[v].mean()) for k, v in rois.items()})
+                row.update({f"r_{k}": float(r[v].mean()) for k, v in rois.items()})
                 rows.append(row)
                 print(f"[{method}] num_ic={num_ic} rep={rep} "
                       + " ".join(f"{k}={v:.4f}" for k, v in row.items() if isinstance(v, float)))

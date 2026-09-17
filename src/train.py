@@ -22,13 +22,14 @@ def build_trainer(cfg, out_dir: Path):
     tcfg = dict(cfg["trainer"])
     ckpt_cfg = tcfg.pop("checkpoint")
     patience = tcfg.pop("early_stopping_patience", 0)
+    es_monitor = tcfg.pop("early_stopping_monitor", ckpt_cfg["monitor"])   # paper: val loss, patience 5
+    es_mode = "min" if es_monitor.endswith("loss") else ckpt_cfg["mode"]
 
     callbacks = [ModelCheckpoint(dirpath=out_dir / "checkpoints",
                                  filename="{epoch:03d}-{val_expl_var:.4f}",
                                  save_last=True, **ckpt_cfg)]
     if patience > 0:
-        callbacks.append(EarlyStopping(monitor=ckpt_cfg["monitor"], mode=ckpt_cfg["mode"],
-                                       patience=patience))
+        callbacks.append(EarlyStopping(monitor=es_monitor, mode=es_mode, patience=patience))
     return pl.Trainer(default_root_dir=out_dir, logger=CSVLogger(out_dir, name="logs"),
                       callbacks=callbacks, accelerator="gpu", devices=1, **tcfg)
 

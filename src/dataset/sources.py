@@ -99,7 +99,7 @@ MNI_BOX = np.array([[-70.0, 70.0], [-100.0, 10.0], [-50.0, 70.0]], np.float32)  
 def _make_subject(rng: np.random.Generator, num_img: int, num_vxl: int, embed_dim: int,
                   noise_std: float, num_common: int = 0, with_coords: bool = False,
                   coord_noise_frac: float = 1.0, field_num_freq: int = 32, field_sigma: float = 1.0,
-                  beta_std: float = 1.0):
+                  beta_std: float = 1.0, weight_rank: int = 0):
     """Random unit-norm image features, random linear weights, beta = x.w + b + noise.
 
     With coordinates, each voxel gets a position in an MNI-like box and its weights are
@@ -109,6 +109,12 @@ def _make_subject(rng: np.random.Generator, num_img: int, num_vxl: int, embed_di
     """
     E = embed_dim
     n_v = rng.standard_normal((num_vxl, E + 1), dtype=np.float32)
+    if weight_rank and weight_rank < E:
+        # weights confined to a random weight_rank-dim subspace shared by the subject's voxels
+        # (curriculum on effective dimension; |w|^2 kept at E as in the isotropic case)
+        U, _ = np.linalg.qr(rng.standard_normal((E, weight_rank), dtype=np.float32))
+        z = rng.standard_normal((num_vxl, weight_rank), dtype=np.float32) * np.sqrt(E / weight_rank)
+        n_v[:, :-1] = z @ U.T
     coord = None
     if with_coords:
         coord = (MNI_BOX[:, 0] + rng.random((num_vxl, 3), dtype=np.float32) * (MNI_BOX[:, 1] - MNI_BOX[:, 0])).astype(np.float32)
@@ -143,7 +149,8 @@ class SyntheticSource:
                  num_train_subjects: int = 2, num_val_subjects: int = 1,
                  noise_std: float = 1.0, num_common: int = 200, seed: int = 0,
                  with_coords: bool = False, coord_noise_frac: float = 1.0,
-                 field_num_freq: int = 32, field_sigma: float = 1.0, beta_std: float = 1.0):
+                 field_num_freq: int = 32, field_sigma: float = 1.0, beta_std: float = 1.0,
+                 weight_rank: int = 0):
         self.embed_dim = embed_dim
         self.num_img = num_img
         self.num_vxl = num_vxl
@@ -153,7 +160,8 @@ class SyntheticSource:
         self.num_common = num_common
         self.seed = seed
         self.gen_kwargs = dict(with_coords=with_coords, coord_noise_frac=coord_noise_frac,
-                               field_num_freq=field_num_freq, field_sigma=field_sigma, beta_std=beta_std)
+                               field_num_freq=field_num_freq, field_sigma=field_sigma, beta_std=beta_std,
+                               weight_rank=weight_rank)
 
     def _subject(self, subject: int, num_common: int = 0):
         rng = np.random.default_rng(self.seed * 1000 + subject)

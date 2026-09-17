@@ -27,6 +27,18 @@ def explained_variance(pred, tar):
     return 1 - torch.var(tar - pred, dim=1) / torch.var(tar, dim=1)
 
 
+def pearson(pred, tar):
+    """Pearson correlation between pred and tar, per row."""
+    _check(pred, tar)
+    if isinstance(pred, np.ndarray):
+        p = pred - pred.mean(axis=1, keepdims=True)
+        t = tar - tar.mean(axis=1, keepdims=True)
+        return np.sum(p * t, axis=1) / (np.linalg.norm(p, axis=1) * np.linalg.norm(t, axis=1) + 1e-12)
+    p = pred - pred.mean(dim=1, keepdim=True)
+    t = tar - tar.mean(dim=1, keepdim=True)
+    return torch.sum(p * t, dim=1) / (torch.norm(p, dim=1) * torch.norm(t, dim=1) + 1e-12)
+
+
 def normed_cos_similarity(pred, tar):
     _check(pred, tar)
     if isinstance(pred, np.ndarray):

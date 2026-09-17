@@ -1,0 +1,42 @@
+# BraInCoRL reproduction, stage 1 (paper Sec. 4.1 / A.2): analysis-by-synthesis pretraining on synthetic
+# linear voxels, fixed context 100 (A.2), AdamW lr 1e-3 wd 1e-4, ReduceLROnPlateau(0.1, patience 5,
+# cooldown 2, threshold 1e-4, min 1e-5) on val loss, early stopping on val loss (patience 5),
+# batch 64. Deviations: 1 GPU, bf16; lr 3e-4 + 1000 warmup steps + grad clip 1.0 instead of lr 1e-3 without
+# warmup/clipping (that setting diverged on 1 GPU at batch 64: train loss 4.4 -> 917 in 5 epochs, outputs/repro/stage1_diverged_lr1e-3);
+# max 40 epochs (paper: up to 100), dropout 0.1 (paper does not state the pretraining dropout).
+seed: 0
+out_dir: outputs/repro/stage1
+data:
+  source:
+    name: synthetic
+    embed_dim: 512
+    num_img: 1000
+    num_vxl: 16000
+    num_train_subjects: 4
+    num_val_subjects: 1
+    noise_std: 1.5
+    beta_std: 0.65
+    seed: 0
+  batch_size: 64
+  max_in_context: 100
+  max_query: 100
+  num_workers: 6
+module:
+  model: {name: braincorl, preset: CLIP, num_layers: 20, ffn_hidden_dim: 2048, num_heads: 10, num_reg_tokens: 4, dropout: 0.1}
+  loss: {name: pmse}
+  val_loss: {name: weight_cos_l2, lambda_l2: 1.0}
+  min_in_context: 100
+  max_in_context: 100
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+trainer:
+  max_epochs: 40
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  limit_val_batches: 0.5
+  checkpoint: {monitor: val_expl_var, mode: max, save_top_k: 1}
+  early_stopping_patience: 5
+  early_stopping_monitor: val_loss

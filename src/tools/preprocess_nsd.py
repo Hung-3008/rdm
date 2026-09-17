@@ -35,7 +35,7 @@ N_SESSIONS, TRIALS_PER_SESSION = 40, 750
 
 
 # ----------------------------------------------------------------------------- mask
-def stage_mask(nsd: Path, out: Path, subj: int):
+def stage_mask(nsd: Path, out: Path, subj: int, voxel_set: str = "hvc"):
     s = f"subj{subj:02d}"
     roi = nsd / "nsddata/ppdata" / s / "func1pt8mm/roi"
     load = lambda p: np.asarray(nib.load(p).get_fdata(), dtype=np.float32)
@@ -46,21 +46,26 @@ def stage_mask(nsd: Path, out: Path, subj: int):
     floc_tval = {c: load(nsd / "nsddata/ppdata" / s / f"func1pt8mm/floc_{FLOC_TVAL[c]}tval.nii.gz") for c in FLOC}
     ncsnr = load(nsd / "nsddata_betas/ppdata" / s / "func1pt8mm" / BETAS_DIR / "ncsnr.nii.gz")
 
-    mask = streams > 1
-    for c in FLOC:
-        mask |= floc_lbl[c] > 0
+    if voxel_set == "hvc":                           # higher visual cortex (default, as in the paper)
+        mask = streams > 1
+        for c in FLOC:
+            mask |= floc_lbl[c] > 0
+    elif voxel_set == "nsdgeneral":                  # NSD general mask (includes early visual)
+        mask = nsdgeneral.copy()
+    else:
+        raise ValueError(voxel_set)
     idx = np.flatnonzero(mask)                       # flat index in nii (x, y, z) C-order
     ijk = np.stack(np.unravel_index(idx, mask.shape), 1)
     affine = nib.load(roi / "streams.nii.gz").affine
     xyz = (affine @ np.c_[ijk, np.ones(len(ijk))].T).T[:, :3]   # scanner-space mm
 
     np.savez(out / f"s{subj}_voxel_meta.npz",
-             idx=idx, ijk=ijk, xyz=xyz.astype(np.float32), shape=np.array(mask.shape),
+             idx=idx, ijk=ijk, xyz=xyz.astype(np.float32), shape=np.array(mask.shape), voxel_set=voxel_set,
              streams=streams.ravel()[idx].astype(np.int8), nsdgeneral=nsdgeneral.ravel()[idx],
              ncsnr=ncsnr.ravel()[idx],
              **{f"floc_{c}_label": floc_lbl[c].ravel()[idx].astype(np.int8) for c in FLOC},
              **{f"floc_{c}_tval": floc_tval[c].ravel()[idx] for c in FLOC})
-    print(f"[mask] s{subj}: {len(idx)} voxels (streams>1: {(streams > 1).sum()}, "
+    print(f"[mask] s{subj} ({voxel_set}): {len(idx)} voxels (streams>1: {(streams > 1).sum()}, nsdgeneral: {nsdgeneral.sum()}, "
           f"ncsnr>0.2 within mask: {(ncsnr.ravel()[idx] > 0.2).sum()})")
 
 
@@ -248,13 +253,15 @@ def main():
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--voxel_set", default="hvc", choices=["hvc", "nsdgeneral"],
+                    help="hvc: streams>1 | floc (paper); nsdgeneral: NSD general mask (use a separate --out)")
     a = ap.parse_args()
 
     nsd, out = Path(a.nsd_root), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     run = lambda st: a.stage in ("all", st)
     if run("mask"):
-        for s in a.subjects: stage_mask(nsd, out, s)
+        for s in a.subjects: stage_mask(nsd, out, s, a.voxel_set)
     if run("coords"):
         for s in a.subjects: stage_coords(nsd, out, s)
     if run("betas"):
