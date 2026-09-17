@@ -109,6 +109,31 @@ with a BraInCoRL run; `--compare_dir` adds a paired bootstrap over voxels
 (`compare_braincorl.csv`). The hippocampus-inspired parts of the original proposal (DG sparse
 code, Hebbian residual memory, NMDA activation) were removed after they did not improve EV.
 
+## `medarc` (single-subject multi-feature encoder)
+
+MedARC's Algonauts 2025 encoder (`references/algonauts2025`, MIT) adapted to static images:
+one `Linear(D_i, d)` per backbone embedding (CLIP / DINOv2 / SigLIP from
+`data/braincorl_nsdgeneral/<backbone>/`), summed (`avg`) or pooled (`linear`, `attn`), then a shared
+plus a subject `Linear(d, V)` decoder; MSE, AdamW, early stopping on mean voxel Pearson of 500
+held-out unique images. Removed from the reference: the depthwise temporal convolution and the
+temporal hidden model (no time axis). Test set: the subject's 1,000 shared images; with
+`eval.ridge` the same training images are also fit by `ridge_cv_brainwise` per backbone and on the
+concatenated features.
+
+```
+src/model/medarc.py          MultiFeatureEncoder, LinearPoolLatent, AttentionPoolLatent
+src/train_medarc.py          python -m src.train_medarc --config src/config/medarc_s1.yaml [k=v ...]
+scripts/medarc_sweep.sh      validation sweep (lr, weight decay, embed_dim, pooling, backbones)
+src/config/medarc_holdout.yaml   trunk on S2/S5/S7 (one decoder per subject); also read by src.eval_lowrank
+scripts/medarc_holdout.sh    layout (concat3 features) | nested (embed_dim) | final D (S1 on the E20 support draws)
+scripts/medarc_holdout_aggregate.py   S1 table vs BraInCoRL-scratch and PopEB-v2 (docs/results.md E34)
+```
+
+New subject: `src.eval_lowrank --ckpt_dir <train_medarc out_dir>` loads `model.pt` as `MedarcTrunk` (feature
+embeddings + pooling, decoders dropped) and uses its d-dimensional output as the basis for the ridge / PopEB fast stage.
+For several backbones the source's `data_dir` must hold the concatenated features (`data/braincorl_nsdgeneral/concat3`);
+the trunk splits them by backbone and unit-normalises each block.
+
 ## Adding a component
 
 ```python

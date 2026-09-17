@@ -1,0 +1,44 @@
+# MedARC encoder trunk (src/model/medarc.py) as the basis for a held-out subject:
+#   python -m src.train_medarc  --config src/config/medarc_holdout.yaml             (trunk on data.subjects)
+#   python -m src.eval_lowrank  --config src/config/medarc_holdout.yaml --ckpt_dir <out_dir> --subject 1 --popeb ...
+# Training values as src/config/medarc_s1.yaml, one decoder per training subject (voxel counts differ, no shared
+# decoder). `data.source` and `fast` are read by src.eval_lowrank (fast = PopEB-v2 values of popeb_clip.yaml).
+# embed_dim: nested leave-one-training-subject-out on S2/S5/S7 (scripts/medarc_holdout.sh).
+seed: 0
+out_dir: outputs/medarc/holdout/s1_clip
+
+data:
+  root: data/braincorl_nsdgeneral
+  subjects: [2, 5, 7]
+  backbones: [clip_b16]
+  val_images: 500
+  standardize: false
+  source:
+    name: npy_multisubj
+    data_dir: data/braincorl_nsdgeneral/clip_b16
+    train_subjects: [2, 5, 7]
+    val_subjects: [2]
+
+model:
+  embed_dim: 192
+  global_pool: avg
+  pool_num_heads: 4
+  with_shared_decoder: false
+  with_subject_decoders: true
+
+train:
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 0.1
+  max_epochs: 1000       # 200 was reached in 8 of 12 nested runs
+  patience: 10
+
+eval:
+  ridge: false
+
+fast:
+  lambdas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]
+  tau2_ratio: 0.0227
+  lam0: 10.0
+  spatial_sigma: 10.0
+  std_global: true

@@ -14,6 +14,7 @@ voxels gives a CI for the EV difference.
 --prior_sigma SIGMA adds the method "lowrank_prior": ridge with the Gaussian anatomical prior mean
 (sigma in mm) built from the training subjects of the config (their full-data coefficients in the
 same basis and s{i}_coords.npy in data_dir).
+--ckpt_dir may also hold a src.train_medarc model.pt (no basis.pt): the MedARC trunk (N, embed_dim) is then the basis.
 --popeb adds the method "lowrank_popeb" (propose01.md section 9): PopEB posterior mean under the
 population prior formed by the full-data coefficients of the training subjects' ncsnr > 0.2 voxels
 (masks from --popeb_meta_dir/s{i}_voxel_meta.npz); tau2 / lam0 / spatial_sigma / std_global come from
@@ -31,9 +32,10 @@ import torch
 from .config import load_config
 from .dataset import SOURCES
 from .eval import predict_ridge, roi_masks
+from .model.medarc import MedarcTrunk
 from .model.lowrank_basis import (FunctionalBasis, LowRankConfig, feature_stats, full_coefficients,
                                   gaussian_anatomical_prior, predict_lowrank)
-from .utils import explained_variance, point_mse, unit_norm
+from .utils import explained_variance, pearson, point_mse, unit_norm
 
 
 def paired_bootstrap(diff: np.ndarray, n_boot: int = 1000, seed: int = 0):
@@ -70,7 +72,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     bundle = SOURCES.build(cfg["data"]["source"]).load_eval(args.subject)
-    basis = FunctionalBasis.from_file(ckpt_dir / "basis.pt", device)
+    if (ckpt_dir / "basis.pt").exists():
+        basis = FunctionalBasis.from_file(ckpt_dir / "basis.pt", device)
+    else:                                                          # src.train_medarc output
+        basis = MedarcTrunk.from_file(ckpt_dir / "model.pt", device)
     fcfg = LowRankConfig(**cfg.get("fast", {}))
     rois = roi_masks(args.voxel_meta) if args.voxel_meta else {}
     true = torch.from_numpy(bundle.query_beta.T).to(device)         # (V, Q)
@@ -127,32 +132,37 @@ def main():
             if args.ridge:
                 preds["ridge"] = (predict_ridge(bundle.ic_img[idx], bundle.ic_beta[idx], bundle.query_img, device)[0], {})
 
-            ref = None
+            ref, ref_r = None, None
             if args.compare_dir:
                 p = Path(args.compare_dir) / f"icl_num_ic={num_ic}_rep={rep}_expl_var.npy"
                 ref = np.load(p) if p.exists() else None
+                p = Path(args.compare_dir) / f"icl_num_ic={num_ic}_rep={rep}_pearson.npy"
+                ref_r = np.load(p) if p.exists() else None
 
             for method, (pred, info) in preds.items():
                 ev = explained_variance(pred, true).cpu().numpy()
+                r = pearson(pred, true).cpu().numpy()
                 np.save(out_dir / f"{method}_num_ic={num_ic}_rep={rep}_expl_var.npy", ev)
+                np.save(out_dir / f"{method}_num_ic={num_ic}_rep={rep}_pearson.npy", r)
                 row = dict(method=method, subject=args.subject, num_ic=num_ic, rep=rep,
-                           expl_var=float(ev.mean()), pt_mse=point_mse(pred, true).mean().item(), **info)
+                           expl_var=float(ev.mean()), pearson=float(r.mean()),
+                           pt_mse=point_mse(pred, true).mean().item(), **info)
                 row.update({f"ev_{k}": float(ev[m].mean()) for k, m in rois.items()})
+                row.update({f"r_{k}": float(r[m].mean()) for k, m in rois.items()})
                 rows.append(row)
                 print(f"[{method}] num_ic={num_ic} rep={rep} "
                       + " ".join(f"{k}={v:.4f}" for k, v in row.items() if isinstance(v, float)))
-                if ref is not None:
-                    sel = rois.get("ncsnr>0.2", np.ones(len(ev), bool))
-                    mean, lo, hi = paired_bootstrap(ev[sel] - ref[sel])
-                    cmp_rows.append(dict(method=method, num_ic=num_ic, rep=rep, roi="ncsnr>0.2",
-                                         ev_method=float(ev[sel].mean()), ev_braincorl=float(ref[sel].mean()),
-                                         diff=mean, ci_lo=lo, ci_hi=hi))
-                    for c in ["faces", "places", "bodies", "words"]:
-                        if c in rois:
-                            mean, lo, hi = paired_bootstrap(ev[rois[c]] - ref[rois[c]])
-                            cmp_rows.append(dict(method=method, num_ic=num_ic, rep=rep, roi=c,
-                                                 ev_method=float(ev[rois[c]].mean()), ev_braincorl=float(ref[rois[c]].mean()),
-                                                 diff=mean, ci_lo=lo, ci_hi=hi))
+                for metric, own, other in [("ev", ev, ref), ("pearson", r, ref_r)]:
+                    if other is None:
+                        continue
+                    for c in ["ncsnr>0.2", "all", "faces", "places", "bodies", "words"]:
+                        sel = rois.get(c, np.ones(len(ev), bool) if c == "ncsnr>0.2" else None)
+                        if sel is None:
+                            continue
+                        mean, lo, hi = paired_bootstrap(own[sel] - other[sel])
+                        cmp_rows.append(dict(method=method, metric=metric, num_ic=num_ic, rep=rep, roi=c,
+                                             ev_method=float(own[sel].mean()), ev_braincorl=float(other[sel].mean()),
+                                             diff=mean, ci_lo=lo, ci_hi=hi))
 
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / "results.csv", index=False)
@@ -161,7 +171,7 @@ def main():
     if cmp_rows:
         cdf = pd.DataFrame(cmp_rows)
         cdf.to_csv(out_dir / "compare_braincorl.csv", index=False)
-        print(cdf.groupby(["method", "num_ic", "roi"])[["ev_method", "ev_braincorl", "diff", "ci_lo", "ci_hi"]]
+        print(cdf.groupby(["method", "metric", "num_ic", "roi"])[["ev_method", "ev_braincorl", "diff", "ci_lo", "ci_hi"]]
               .mean().round(4))
 
 
