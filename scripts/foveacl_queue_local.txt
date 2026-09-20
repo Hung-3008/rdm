@@ -1,0 +1,4 @@
+R0_s0 --mode crop --seed 0
+R2_s0 --mode fix --a_rel 0.238 --seed 0
+R0_s1 --mode crop --seed 1
+R3a_s0 --mode fix --a_rel 0.119 --seed 0

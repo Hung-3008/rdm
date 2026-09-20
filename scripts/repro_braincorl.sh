@@ -3,7 +3,9 @@
 #   sh scripts/repro_braincorl.sh synth  BB              # stages 1-2 (synthetic), once per backbone
 #   sh scripts/repro_braincorl.sh stage3 BB H            # stage 3 on the 3 other subjects, then eval on hold-out H
 #   sh scripts/repro_braincorl.sh queue  BB H1 [H2 ...]  # synth (if missing) + stage3 for each H
-# BB in {clip_b16, dinov2_base, siglip_so400m}; H in {1,2,5,7}. Outputs: outputs/repro/<BB>/{stage1,stage2,stage3_s<H>,eval_s<H>_*,popeb_s<H>_*}.
+# BB in {clip_b16, dinov2_base, siglip_so400m, clip_pca512_clsmean_all}; H in {1,2,5,7}. Outputs: outputs/repro/<BB>/{stage1,stage2,stage3_s<H>,eval_s<H>_*,popeb_s<H>_*}.
+# Env: SEED=s (training seed, outputs/repro/<BB>_seed<s>); ROOT=dir (data root, default data/braincorl_nsdgeneral; a
+# different root writes to outputs/repro_<basename ROOT>/<BB>); SKIP_POPEB=1 (BraInCoRL eval only).
 # Stage 3 eval: src.eval (BraInCoRL ckpt with best val_expl_var + ridge) and PopEB-v2 (basis K32 trained on the same
 # three subjects, src.eval_lowrank --popeb --compare_dir) on the same support draws (100 x 5; 30/300/1000 x 3), EV + Pearson.
 set -e
@@ -14,10 +16,12 @@ case $BB in
   clip_b16)      PRESET=CLIP;   E=512;  BS=64; ACC=1 ;;
   dinov2_base)   PRESET=DINO;   E=768;  BS=32; ACC=2 ;;   # batch 64 OOM at context 500 (22.4 GiB allocated at step 1)
   siglip_so400m) PRESET=SIGLIP; E=1152; BS=32; ACC=2 ;;   # batch 64 does not fit 24 GB at context 500
+  clip_pca512_*) PRESET=CLIP;   E=512;  BS=64; ACC=1 ;;   # multi-layer CLIP PCA-512 (scripts/clip_layers_ceiling.py --layout ... --gt)
   *) echo "unknown backbone $BB"; exit 1 ;;
 esac
-OUT=outputs/repro/$BB; DATA=data/braincorl_nsdgeneral/$BB; NG=data/braincorl_nsdgeneral
-MODEL="module.model.preset=$PRESET"
+NG=${ROOT:-data/braincorl_nsdgeneral}; DATA=$NG/$BB
+OUT=outputs/repro/$BB; [ -n "$ROOT" ] && OUT=outputs/repro_$(basename $NG)/$BB
+MODEL="module.model.preset=$PRESET"; [ -n "$SEED" ] && { OUT=${OUT}_seed$SEED; MODEL="$MODEL seed=$SEED"; }
 mkdir -p $OUT
 best_ckpt() { ls "$1"/checkpoints/epoch=*-val_expl_var=*.ckpt | sort -t= -k3 -n | tail -1; }
 
@@ -48,7 +52,10 @@ stage3() {
     [ -f $OUT/eval_s${H}_$TAG/results.csv ] || python -m src.eval --config src/config/braincorl_clip_3090.yaml --ckpt "$C3" --subject $H --num_ic $NIC --repeats $REP --ridge \
         --voxel_meta $META --out_dir $OUT/eval_s${H}_$TAG data.source.data_dir=$DATA $SUBJ > $OUT/eval_s${H}_$TAG.log 2>&1
   done
-  # PopEB-v2 on the same draws (basis K32 on the same three subjects, config popeb_clip.yaml, tau2 by ratio)
+  # PopEB-v2 on the same draws (basis K32 on the same three subjects, config popeb_clip.yaml, tau2 by ratio).
+  # SKIP_POPEB=1 when the layout holds a BraInCoRL-specific train/val split (scripts/valuniq_layout.py): PopEB must
+  # see the unsplit layout, otherwise train_lowrank splits the already reduced training set a second time.
+  [ "$SKIP_POPEB" = "1" ] && { echo "[done s$H] $OUT/eval_s${H}_* (popeb skipped)"; return; }
   mkdir -p $OUT/popeb_s$H; [ -f $OUT/popeb_s$H/K32/basis.pt ] || python -m src.train_lowrank --config src/config/popeb_clip.yaml --out_dir $OUT/popeb_s$H/K32 data.source.data_dir=$DATA $SUBJ > $OUT/popeb_s$H/K32.train.log 2>&1
   for SET in "100 --repeats 5 ic100" "30 300 1000 --repeats 3 scaling"; do
     NIC=$(echo "$SET" | sed 's/ --repeats.*//'); REP=$(echo "$SET" | sed 's/.*--repeats \([0-9]*\).*/\1/'); TAG=$(echo "$SET" | awk '{print $NF}')

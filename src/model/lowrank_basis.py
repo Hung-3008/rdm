@@ -25,16 +25,18 @@ import torch.nn.functional as F_
 
 
 class FunctionalBasis(nn.Module):
-    """Shared K-dimensional functional basis over image embeddings."""
+    """Shared K-dimensional functional basis over image embeddings.
+    hidden_dim = 0: a fixed linear projection f(x) = x U2 (e.g. PCA, scripts/propose01_pca_basis.py)."""
 
     def __init__(self, embed_dim: int, hidden_dim: int, basis_dim: int):
         super().__init__()
-        self.lin1 = nn.Linear(embed_dim, hidden_dim)
-        self.lin2 = nn.Linear(hidden_dim, basis_dim, bias=False)
+        if hidden_dim > 0:
+            self.lin1 = nn.Linear(embed_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim or embed_dim, basis_dim, bias=False)
         self.cfg = dict(embed_dim=embed_dim, hidden_dim=hidden_dim, basis_dim=basis_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lin2(F_.silu(self.lin1(x)))
+        return self.lin2(F_.silu(self.lin1(x)) if self.cfg["hidden_dim"] > 0 else x)
 
     @classmethod
     def from_file(cls, path, device) -> "FunctionalBasis":
