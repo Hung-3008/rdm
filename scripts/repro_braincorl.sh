@@ -1,5 +1,5 @@
 #!/bin/sh
-# BraInCoRL reproduction on the nsdgeneral voxel set (docs/results.md E20): 3 backbones x 4 hold-out subjects.
+# BraInCoRL reproduction on the nsdgeneral voxel set (docs/research-log-2026-09.md section 2): 3 backbones x 4 hold-out subjects.
 #   sh scripts/repro_braincorl.sh synth  BB              # stages 1-2 (synthetic), once per backbone
 #   sh scripts/repro_braincorl.sh stage3 BB H            # stage 3 on the 3 other subjects, then eval on hold-out H
 #   sh scripts/repro_braincorl.sh queue  BB H1 [H2 ...]  # synth (if missing) + stage3 for each H
@@ -52,19 +52,9 @@ stage3() {
     [ -f $OUT/eval_s${H}_$TAG/results.csv ] || python -m src.eval --config src/config/braincorl_clip_3090.yaml --ckpt "$C3" --subject $H --num_ic $NIC --repeats $REP --ridge \
         --voxel_meta $META --out_dir $OUT/eval_s${H}_$TAG data.source.data_dir=$DATA $SUBJ > $OUT/eval_s${H}_$TAG.log 2>&1
   done
-  # PopEB-v2 on the same draws (basis K32 on the same three subjects, config popeb_clip.yaml, tau2 by ratio).
-  # SKIP_POPEB=1 when the layout holds a BraInCoRL-specific train/val split (scripts/valuniq_layout.py): PopEB must
-  # see the unsplit layout, otherwise train_lowrank splits the already reduced training set a second time.
-  [ "$SKIP_POPEB" = "1" ] && { echo "[done s$H] $OUT/eval_s${H}_* (popeb skipped)"; return; }
-  mkdir -p $OUT/popeb_s$H; [ -f $OUT/popeb_s$H/K32/basis.pt ] || python -m src.train_lowrank --config src/config/popeb_clip.yaml --out_dir $OUT/popeb_s$H/K32 data.source.data_dir=$DATA $SUBJ > $OUT/popeb_s$H/K32.train.log 2>&1
-  for SET in "100 --repeats 5 ic100" "30 300 1000 --repeats 3 scaling"; do
-    NIC=$(echo "$SET" | sed 's/ --repeats.*//'); REP=$(echo "$SET" | sed 's/.*--repeats \([0-9]*\).*/\1/'); TAG=$(echo "$SET" | awk '{print $NF}')
-    [ -f $OUT/popeb_s${H}_$TAG/results.csv ] || python -m src.eval_lowrank --config src/config/popeb_clip.yaml --ckpt_dir $OUT/popeb_s$H/K32 --subject $H --num_ic $NIC --repeats $REP --popeb \
-        --voxel_meta $META --popeb_meta_dir $NG --compare_dir $OUT/eval_s${H}_$TAG --out_dir $OUT/popeb_s${H}_$TAG data.source.data_dir=$DATA $SUBJ > $OUT/popeb_s${H}_$TAG.log 2>&1
-  done
-  echo "[done s$H] $OUT/eval_s${H}_* $OUT/popeb_s${H}_*"
+  echo "[done s$H] $OUT/eval_s${H}_*"
 }
-# NO_SYNTH=1: skip the synthetic stages and train stage 3 from random init (docs/results.md E20: the synthetic
+# NO_SYNTH=1: skip the synthetic stages and train stage 3 from random init (docs/research-log-2026-09.md section 2: the synthetic
 # stages did not learn in-context regression within budget). The stage-3 init file is then "null".
 INIT=$OUT/stage2_best.ckpt; [ "$NO_SYNTH" = "1" ] && INIT=null
 case $CMD in

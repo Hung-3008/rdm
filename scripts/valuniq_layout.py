@@ -1,5 +1,5 @@
 """npy_multisubj layout whose validation split is the one PopEB-v2 uses, for a fair BraInCoRL comparison
-(docs/results_new.md 7.7).
+(docs/research-log-2026-09.md section 8).
 
     python scripts/valuniq_layout.py --layout clip_pca512_clsmean_all --holdout 1 2 5 7 [--root data/braincorl_nsdgeneral]
 

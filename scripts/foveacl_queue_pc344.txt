@@ -1,7 +1,0 @@
-R1_s0 --mode fix --seed 0
-R0_s2 --mode crop --seed 2
-R3b_s0 --mode fix --a_rel 0.476 --seed 0
-R4_s0 --mode fix --a_rel 0.238 --acuity --seed 0
-R2_s2 --mode fix --a_rel 0.238 --seed 2
-R1_s1 --mode fix --seed 1
-R2_s1 --mode fix --a_rel 0.238 --seed 1

@@ -39,112 +39,41 @@ Mapping to the original scripts: `model.py` -> `model/layers.py` + `model/brainc
 `dataset.py` -> `dataset/`; `utils.py` -> `utils/`;
 `train_pl_mul_subj.py` -> `train.py`; `test_det.py` -> `eval.py`.
 
-## `braincorl_coord` (step 3)
+## BraInCoRL training protocol (`scripts/repro_braincorl.sh`)
 
-`model/braincorl_coord.py` adds one token to BraInCoRL: Fourier features of the voxel's
-MNI coordinate (NRF-style, `gamma(x) = [cos(2*pi*B x/s), sin(2*pi*B x/s)]`, `B ~ N(0, sigma^2)`
-fixed, `s = coord_scale_mm`) passed through a 2-layer MLP. Token order is
-`[register tokens, coordinate token, context]`; the first register token is still read
-out. Training augmentations: Gaussian jitter of the coordinate (`jitter_mm`) and
-replacement of the token by a learned `no_coord_token` with probability
-`coord_token_dropout`. With `min_in_context: 0` the model is also trained on empty
-contexts, i.e. zero-shot from the coordinate alone.
+Three stages; stage 1-2 are synthetic and were skipped in the runs that produced the numbers
+in `docs/research-log-2026-09.md` section 2 (`NO_SYNTH=1`, stage 3 from random init), because
+the synthetic stages did not learn in-context regression within budget.
 
-Coordinates come from `preprocess_nsd --stage coords` (NSD `MNI-to-func1pt8.nii.gz`,
-index -> mm as in NRF `common.py`) and are read when the source has `with_coords: true`;
-batches then carry a 6th element `coord (B, 3)`; `braincorl` ignores it.
+| stage | config | data | context | stop |
+| --- | --- | --- | --- | --- |
+| 1 | `config/repro/stage1_synth.yaml` | synthetic, 4 x 16k voxels | fixed 500 | <= 15 epochs, patience 3 |
+| 2 | `config/repro/stage2_synth_ctx.yaml` | same synthetic data | U(0, 500) | <= 10 epochs, patience 3 |
+| 3 | `config/repro/stage3_real.yaml` | NSD, three training subjects, one held out | U(0, 500) | patience 10 |
 
-`module.init_from_original` loads a released checkpoint with `strict=False`, so the 20-layer
-transformer and heads start from the paper's weights and only the 0.39M coordinate
-parameters are new. Config: `config/braincorl_coord_clip_3090.yaml` (held-out S1, init from
-`CLIP_trained_on_s257.pth`); batch 64 with the extra token peaks at 19.3 GiB.
+Deviations from the paper: single GPU, bf16; context lower bound 0 instead of 30 in stages 2-3.
+Each stage initialises from the best `val_expl_var` checkpoint of the previous one
+(`module.init_weights`).
 
-## From-scratch protocol (`scripts/train_scratch.sh <model>`)
+`ModelCheckpoint(save_last=True, save_top_k=2)` writes `last.ckpt` only when it writes a top-k
+checkpoint, so `--resume` can lose epochs when `val_expl_var` plateaus. Add a second
+`ModelCheckpoint` without `monitor` if resume has to be exact.
 
-Both `braincorl` (reproduction) and `braincorl_coord` go through the same three stages so
-that the comparison isolates the coordinate token:
-
-| stage | config | data | context | lr / wd / dropout | stop |
-| --- | --- | --- | --- | --- | --- |
-| 1 | `config/scratch/stage1_synth.yaml` | synthetic, 4 × 16k voxels, noise_std 1.5 (EV ceiling 0.31), beta_std 0.65, coordinates in an MNI-like box with a smooth weight field (`coord_noise_frac` 0.5) | fixed 500 | 1e-3 / 1e-4 / 0.1 | ≤ 15 epochs, patience 3 |
-| 2 | `config/scratch/stage2_synth_ctx.yaml` | same synthetic data | U(0, 500) | 1e-3 / 1e-4 / 0.1 | ≤ 10 epochs, patience 3 |
-| 3 | `config/scratch/stage3_real.yaml` | NSD S2/S5/S7, held-out S1 | U(0, 500) | 1e-4 / 0.1 / 0.5 (train.sh) | ≤ 30 epochs, patience 5 |
-
-Deviations from the paper: single GPU, bf16; context lower bound 0 instead of 30 in
-stages 2–3 (so the coordinate-only case is trained); synthetic voxels carry coordinates
-(ignored by `braincorl`). Each stage initialises from the best `val_expl_var` checkpoint
-of the previous one (`module.init_weights`). Outputs: `outputs/scratch/<model>/stage{1,2,3_s1}/`.
-
-## `lowrank` (docs/propose/propose01.md)
-
-A non-meta-learning baseline for new-subject encoding: a shared K-dimensional basis
-`f(x) = SiLU(x U1 + b1) U2` trained once on the training subjects by plain multi-output
-regression (one linear head per training subject, heads discarded), then per-subject ridge
-over the K basis features in closed form, with one lambda for all voxels chosen by
-leave-one-out. K = 16 was selected by nested leave-one-training-subject-out on S2/S5/S7.
-On held-out S1 (100 support x 5 draws) it reaches EV 0.118 on ncsnr > 0.2 voxels vs 0.123
-for BraInCoRL and 0.064 for ridge on the same support (propose01.md, section 6).
-
-```
-src/model/lowrank_basis.py   FunctionalBasis, SubjectHeads, ridge_loo, predict_lowrank,
-                             full_coefficients + gaussian_anatomical_prior (prior mean C0 for the ridge)
-src/train_lowrank.py         python -m src.train_lowrank --config src/config/lowrank_clip.yaml [k=v ...]
-src/eval_lowrank.py          python -m src.eval_lowrank --config ... --ckpt_dir <dir> --subject 1 --num_ic 100 --repeats 5 \
-                                --ridge --voxel_meta data/braincorl/s1_voxel_meta.npz --compare_dir outputs/propose01/braincorl_s1_ic100 \
-                                [--prior_sigma 5]   # adds method lowrank_prior
-scripts/propose01_sweep.sh   nested selection of K + S1 sensitivity; scripts/propose01_aggregate.py prints the tables
-scripts/propose01_prior_test.py   prior ablation (ball vs Gaussian sigma, shrink factor gamma by LOO, fsaverage prior)
-src/tools/build_surfmap.py   fsaverage-vertex -> func1pt8-voxel table from NSD transforms in data/nsd_surf/ (for --surf_map)
-```
-
-`--prior_sigma 5` (mm) builds, for every voxel of the held-out subject, the Gaussian-weighted (MNI
-distance) mean of the training subjects' full-data basis coefficients and uses it as the ridge
-prior mean (`C = C0 + ridge(F, B - F C0)`). On S1 vs BraInCoRL on the same support draws
-(`outputs/propose01/prior_s1_*`): 30 support 0.095 vs 0.087, 100: 0.123 vs 0.123,
-300: 0.142 vs 0.144, 1000: 0.153 vs 0.153 (EV on ncsnr > 0.2; plain lowrank: 0.083 / 0.118 /
-0.141 / 0.153).
-
-Support slicing follows `src/eval.py`, so a run with the same `--num_ic --repeats` is paired
-with a BraInCoRL run; `--compare_dir` adds a paired bootstrap over voxels
-(`compare_braincorl.csv`). The hippocampus-inspired parts of the original proposal (DG sparse
-code, Hebbian residual memory, NMDA activation) were removed after they did not improve EV.
-
-## `medarc` (single-subject multi-feature encoder)
-
-MedARC's Algonauts 2025 encoder (`references/algonauts2025`, MIT) adapted to static images:
-one `Linear(D_i, d)` per backbone embedding (CLIP / DINOv2 / SigLIP from
-`data/braincorl_nsdgeneral/<backbone>/`), summed (`avg`) or pooled (`linear`, `attn`), then a shared
-plus a subject `Linear(d, V)` decoder; MSE, AdamW, early stopping on mean voxel Pearson of 500
-held-out unique images. Removed from the reference: the depthwise temporal convolution and the
-temporal hidden model (no time axis). Test set: the subject's 1,000 shared images; with
-`eval.ridge` the same training images are also fit by `ridge_cv_brainwise` per backbone and on the
-concatenated features.
-
-```
-src/model/medarc.py          MultiFeatureEncoder, LinearPoolLatent, AttentionPoolLatent
-src/train_medarc.py          python -m src.train_medarc --config src/config/medarc_s1.yaml [k=v ...]
-scripts/medarc_sweep.sh      validation sweep (lr, weight decay, embed_dim, pooling, backbones)
-src/config/medarc_holdout.yaml   trunk on S2/S5/S7 (one decoder per subject); also read by src.eval_lowrank
-scripts/medarc_holdout.sh    layout (concat3 features) | nested (embed_dim) | final D (S1 on the E20 support draws)
-scripts/medarc_holdout_aggregate.py   S1 table vs BraInCoRL-scratch and PopEB-v2 (docs/results.md E34)
-```
-
-New subject: `src.eval_lowrank --ckpt_dir <train_medarc out_dir>` loads `model.pt` as `MedarcTrunk` (feature
-embeddings + pooling, decoders dropped) and uses its d-dimensional output as the basis for the ridge / PopEB fast stage.
-For several backbones the source's `data_dir` must hold the concatenated features (`data/braincorl_nsdgeneral/concat3`);
-the trunk splits them by backbone and unit-normalises each block.
+`scripts/valuniq_layout.py` builds a layout that splits each training subject's unique images
+8,400 / 600 so that a comparison method selects its model on the same held-out images
+(`docs/research-log-2026-09.md` section 8).
 
 ## Adding a component
 
 ```python
 from src.model.factory import MODELS
 
-@MODELS.register("braincorl_coord")
-class BraInCoRLCoord(nn.Module):
+@MODELS.register("my_model")
+class MyModel(nn.Module):
     def forward(self, ic_img, ic_beta, query_img): ...   # -> (pred (B,Q), weights (B,E+1))
 ```
 
-then set `module.model.name: braincorl_coord` in YAML. Extra batch fields (e.g. voxel
+then set `module.model.name: my_model` in YAML. Extra batch fields (e.g. voxel
 coordinates) need a new `SubjectArrays` field, a new source, and a matching
 `IclVoxelDataset.__getitem__`; the LightningModule unpacks the batch in `_step`.
 
@@ -168,7 +97,7 @@ files. `python -m src.tools.preprocess_nsd` builds them from raw NSD
 | stage | output | choice made |
 | --- | --- | --- |
 | `mask` | `s{i}_voxel_meta.npz` (flat index, ijk, scanner xyz, streams/floc labels, floc t-values, ncsnr) | voxel set = streams labels 2–7 (non-early) ∪ floc ROIs; 22612 / 21714 / 20152 / 18231 voxels for S1/2/5/7 (the original code mentions 22961 for its test subject) |
-| `betas` | `s{i}_betas_{unique,common}.npy`, `s{i}_nsdid_*.npy` | z-score per voxel within session, average the 3 repeats; hdf5 or nii.gz sessions (verified identical) |
+| `betas` | `s{i}_betas_{unique,common}.npy`, `s{i}_nsdid_*.npy` | z-score per voxel within session, average the 3 repeats; hdf5 or nii.gz sessions (verified identical). The averaging is at `tools/preprocess_nsd.py:126-138`; a single-trial layout needs that step changed. |
 | `feats` | `feats_clip_b16_73k.npy` (73000, 512) | CLIP ViT-B/16 `image_embeds`, unit-normed at use |
 | `gt` | `s{i}_gt.npy` | `ridge_cv_brainwise` on the 9000 unique images |
 | `layout` | `data/braincorl/clip_b16/` | `_val` files = the subject's 1000 shared images; `test_time_icl_idx.json` = seeded permutation |
