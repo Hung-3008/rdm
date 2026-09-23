@@ -224,6 +224,8 @@ def main():
     ap.add_argument("--num_ic", type=int, nargs="+", default=N_ALL)
     ap.add_argument("--reps", type=int, nargs="+", default=list(range(REPS_ALL)), help="which repeats (support draws)")
     ap.add_argument("--sigma_mm", type=float, default=10.0)
+    ap.add_argument("--latent", default=None, help="latent.pt (default outputs/sflm/h<H>/latent.pt)")
+    ap.add_argument("--dict", default=None, help=".pt with the mask dictionary A (M, 49) (default: mask_dictionary(), 70 masks)")
     ap.add_argument("--lam_pop", type=float, default=1.0, help="#6 ridge penalty of the population fit, both modes")
     # mode sflm constants (pilot defaults)
     ap.add_argument("--lam0", type=float, default=10.0)
@@ -244,6 +246,7 @@ def main():
     ap.add_argument("--em_iters", type=int, default=30, help="#11 iteration cap of the fixed point")
     ap.add_argument("--tol", type=float, default=1e-3, help="#11 relative tau2 change below which an iteration counts as converged")
     ap.add_argument("--conv_consec", type=int, default=5, help="#11 consecutive converged iterations to stop")
+    ap.add_argument("--ll_tol", type=float, default=None, help="#11 alt: an iteration also counts as converged when |d loglik| < ll_tol (nat)")
     ap.add_argument("--tau2_init", type=float, default=1.0, help="#9 tau2 init of the fixed point (units of v_m)")
     ap.add_argument("--update", choices=["mackay", "em"], default="mackay")
     ap.add_argument("--no_secant", dest="secant", action="store_false", help="plain fixed point without the secant step on log tau2")
@@ -267,8 +270,9 @@ def main():
         logf.flush()
 
     log(f"[args] {vars(a)}")
-    cache_path = out / "cache_pool.pt"
-    cache = torch.load(cache_path) if cache_path.exists() else build_cache(H, cache_path)
+    cache_path = out / ("cache_pool.pt" if a.dict is None else f"cache_pool_{Path(a.dict).stem}.pt")
+    A_dict = None if a.dict is None else torch.load(a.dict)["A"]
+    cache = torch.load(cache_path) if cache_path.exists() else build_cache(H, cache_path, a.latent, A_dict)
     U_all = torch.cat([cache["U_tr"][s] for s in TRAIN[H]]).to(DEV)
     u_mean, u_std = U_all.mean(0, keepdim=True), U_all.std(0, keepdim=True).clamp_min(1e-6)
     del U_all

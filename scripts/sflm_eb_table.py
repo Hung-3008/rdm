@@ -17,20 +17,26 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="outputs/sflm_eb")
 ap.add_argument("--ref", default="sflm_default")
 ap.add_argument("--tag", default="eb_mackay")
+ap.add_argument("--ref_out", default=None, help="directory of the reference results (default --out)")
 ap.add_argument("--folds", type=int, nargs="+", default=[1, 2, 5, 7])
 a = ap.parse_args()
 pd.set_option("display.width", 220)
 
-frames = []
-for f in a.folds:
-    p = Path(a.out) / f"h{f}" / "results.csv"
-    if p.exists():
-        d = pd.read_csv(p)
-        d["fold"] = f
-        frames.append(d)
-df = pd.concat(frames, ignore_index=True)
+def load(root):
+    frames = []
+    for f in a.folds:
+        p = Path(root) / f"h{f}" / "results.csv"
+        if p.exists():
+            d = pd.read_csv(p)
+            d["fold"] = f
+            frames.append(d)
+    return pd.concat(frames, ignore_index=True)
+
+
+df = load(a.out)
 key = ["fold", "n", "rep"]
-ref = df[df.tag == a.ref].set_index(key)
+ref = load(a.ref_out or a.out)
+ref = ref[ref.tag == a.ref].set_index(key)
 arm = df[df.tag == a.tag].set_index(key)
 both = ref.join(arm, how="inner", lsuffix="_ref", rsuffix="_arm")
 both["d"] = both.ev_arm - both.ev_ref

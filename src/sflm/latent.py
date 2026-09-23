@@ -75,6 +75,42 @@ class SourceReadout(nn.Module):
         return (torch.einsum("bmk,vm->bvk", U, torch.softmax(self.logit, 1)) * self.C).sum(-1) + self.b
 
 
+class GaussianReadout(nn.Module):
+    """Continuous receptive field per voxel (option A): a_v(p) ∝ exp(-|p - mu_v|^2 / 2 sigma_v^2) over the side x side grid,
+    beta_v(x) = c_v' sum_p a_v(p) z_p(x) + b_v.  mu_v (2, cells) starts at the grid centre, sigma_v (cells) at sigma0;
+    sigma is clamped to [0.3, 6] cells (6 cells on a 7-cell grid is close to a uniform mask)."""
+
+    def __init__(self, V: int, K: int, side: int = 7, sigma0: float = 2.0):
+        super().__init__()
+        yy, xx = torch.meshgrid(torch.arange(side, dtype=torch.float32), torch.arange(side, dtype=torch.float32), indexing="ij")
+        self.register_buffer("grid", torch.stack([yy.ravel(), xx.ravel()], 1))       # (P, 2)
+        self.mu = nn.Parameter(torch.full((V, 2), (side - 1) / 2.0))
+        self.log_sigma = nn.Parameter(torch.full((V,), float(np.log(sigma0))))
+        self.C = nn.Parameter(torch.randn(V, K) * 0.01)
+        self.b = nn.Parameter(torch.zeros(V))
+        self.side = side
+
+    def sigma(self) -> torch.Tensor:
+        return self.log_sigma.exp().clamp(0.3, 6.0)
+
+    def masks(self) -> torch.Tensor:                                     # (V, P), rows sum to 1
+        mu = self.mu.clamp(-1.0, self.side)
+        d2 = ((self.grid[None] - mu[:, None]) ** 2).sum(-1)               # (V, P)
+        return torch.softmax(-0.5 * d2 / self.sigma()[:, None] ** 2, 1)
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:                  # (B, P, K) -> (B, V)
+        U = torch.einsum("bpk,vp->bvk", Z, self.masks())
+        return (U * self.C).sum(-1) + self.b
+
+
+def gaussian_dictionary(mu: torch.Tensor, sigma: torch.Tensor, side: int = 7) -> torch.Tensor:
+    """(M, side*side) rows summing to 1: Gaussians at the given centres mu (M, 2) and widths sigma (M,) in cells."""
+    yy, xx = torch.meshgrid(torch.arange(side, dtype=torch.float32), torch.arange(side, dtype=torch.float32), indexing="ij")
+    grid = torch.stack([yy.ravel(), xx.ravel()], 1).to(mu.device)
+    d2 = ((grid[None] - mu[:, None]) ** 2).sum(-1)
+    return torch.softmax(-0.5 * d2 / sigma[:, None] ** 2, 1)
+
+
 def split_8400_600(n_subj: int, seed: int = 0, n_img: int = 9000, n_val: int = 600):
     rng = np.random.default_rng(seed)
     out = []
@@ -84,24 +120,34 @@ def split_8400_600(n_subj: int, seed: int = 0, n_img: int = 9000, n_val: int = 6
     return out
 
 
-def train_latent(train_subj, store, A, a, out: Path):
+def train_latent(train_subj, store, A, a, out: Path, readout: str = "dict"):
+    """readout "dict": SourceReadout over the mask dictionary A (M, P); "gauss": GaussianReadout (continuous RF per voxel,
+    A unused).  latent.pt stores the latent map; with "gauss" also rf = {subject: (mu (V, 2), sigma (V,))} at the best epoch."""
     betas = [torch.from_numpy(np.load(DATA / f"s{s}_betas_unique.npy")).to(DEV) for s in train_subj]
     X = [store(np.load(DATA / f"s{s}_nsdid_unique.npy")) for s in train_subj]
     split = split_8400_600(len(train_subj))
     samp = torch.cat([x[torch.randperm(x.shape[0], device=DEV)[:700]] for x in X]).float().reshape(-1, X[0].shape[-1])
     g = LatentMap(X[0].shape[-1], a.hidden, a.K, samp.mean(0), samp.std(0).clamp_min(1e-3)).to(DEV)
-    heads = nn.ModuleList([SourceReadout(b.shape[1], A.shape[0], a.K) for b in betas]).to(DEV)
+    if readout == "dict":
+        heads = nn.ModuleList([SourceReadout(b.shape[1], A.shape[0], a.K) for b in betas]).to(DEV)
+        slow = [h.logit for h in heads] + [h.b for h in heads]
+    else:
+        heads = nn.ModuleList([GaussianReadout(b.shape[1], a.K) for b in betas]).to(DEV)
+        slow = [h.mu for h in heads] + [h.log_sigma for h in heads] + [h.b for h in heads]
     opt = torch.optim.AdamW([{"params": g.parameters(), "weight_decay": 0.0},
                              {"params": [h.C for h in heads], "weight_decay": 1e-4},
-                             {"params": [h.logit for h in heads] + [h.b for h in heads], "weight_decay": 0.0, "lr": 1e-2}],
+                             {"params": slow, "weight_decay": 0.0, "lr": 1e-2}],
                             lr=1e-3)
+
+    def head(k, Z):
+        return heads[k](torch.einsum("mp,bpk->bmk", A, Z)) if readout == "dict" else heads[k](Z)
 
     def val_ev():
         g.eval()
         with torch.no_grad():
             evs = []
             for k, (_, va) in enumerate(split):
-                pred = torch.cat([heads[k](torch.einsum("mp,bpk->bmk", A, g(X[k][va[i:i + 200]]))) for i in range(0, len(va), 200)])
+                pred = torch.cat([head(k, g(X[k][va[i:i + 200]])) for i in range(0, len(va), 200)])
                 evs.append(explained_variance(pred.T, betas[k][va].T).mean().item())
         g.train()
         return float(np.mean(evs)), evs
@@ -115,8 +161,8 @@ def train_latent(train_subj, store, A, a, out: Path):
             for k in range(len(train_subj)):
                 idx = perms[k][i * a.batch:(i + 1) * a.batch]
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    U = torch.einsum("mp,bpk->bmk", A, g(X[k][idx]))
-                loss = loss + torch.mean((heads[k](U.float()) - betas[k][idx]) ** 2)
+                    Z = g(X[k][idx])
+                loss = loss + torch.mean((head(k, Z.float()) - betas[k][idx]) ** 2)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -126,14 +172,17 @@ def train_latent(train_subj, store, A, a, out: Path):
         print(f"[latent] epoch {ep:3d} loss {rows[-1]['loss']:.4f} val_ev {ev:.4f} " + " ".join(f"{v:.4f}" for v in evs), flush=True)
         if ev > best:
             best, best_ep = ev, ep
-            torch.save(dict(state=g.state_dict(), cfg=dict(in_dim=X[0].shape[-1], hidden=a.hidden, K=a.K)), out / "latent.pt")
+            ck = dict(state=g.state_dict(), cfg=dict(in_dim=X[0].shape[-1], hidden=a.hidden, K=a.K), readout=readout)
+            if readout == "gauss":
+                ck["rf"] = {s: (h.mu.detach().clamp(-1.0, h.side).cpu(), h.sigma().detach().cpu()) for s, h in zip(train_subj, heads)}
+            torch.save(ck, out / "latent.pt")
         elif ep - best_ep >= a.patience:
             break
     pd.DataFrame(rows).to_csv(out / "latent_log.csv", index=False)
     g.load_state_dict(torch.load(out / "latent.pt")["state"])
     g.eval()
     with torch.no_grad():                                                  # pooled channels of every training image
-        U = [torch.cat([torch.einsum("mp,bpk->bmk", A, g(x[i:i + 500])) for i in range(0, x.shape[0], 500)]) for x in X]
+        U = [torch.cat([torch.einsum("mp,bpk->bmk", A, g(x[i:i + 500])) for i in range(0, x.shape[0], 500)]) for x in X] if A is not None else None
     del X
     torch.cuda.empty_cache()
     return g, U, betas, dict(best_val_ev=best, best_epoch=best_ep, train_sec=time.time() - t0)

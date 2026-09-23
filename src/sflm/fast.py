@@ -55,13 +55,15 @@ def kernel_average(xyz_v: torch.Tensor, xyz_p: torch.Tensor, val_p: torch.Tensor
 
 
 @torch.inference_mode()
-def build_cache(H: int, path: Path):
-    ck = torch.load(f"outputs/sflm/h{H}/latent.pt", map_location=DEV)
+def build_cache(H: int, path: Path, latent: str = None, A: torch.Tensor = None):
+    """Pooled channels u_m of every image of the fold, for the latent map `latent` (default outputs/sflm/h<H>/latent.pt) and
+    the mask dictionary A (M, P) (default mask_dictionary())."""
+    ck = torch.load(latent or f"outputs/sflm/h{H}/latent.pt", map_location=DEV)
     cfg = ck["cfg"]
     g = LatentMap(cfg["in_dim"], cfg["hidden"], cfg["K"], torch.zeros(cfg["in_dim"]), torch.ones(cfg["in_dim"])).to(DEV)
     g.load_state_dict(ck["state"])
     g.eval()
-    A = mask_dictionary().to(DEV)
+    A = (mask_dictionary() if A is None else A).to(DEV)
     store = GridStore()
 
     def pool(ids):
@@ -270,7 +272,8 @@ def eb_fit_mackay(eb: EB, a, log):
         log(f"[eb] it {it} tau2 {tau2:.5f} sig2 median {sig2.median().item():.4f} loglik {ll:.1f}"
             + (f" grad_prev {sec[-1][1]:.1f}" if sec else ""))
         if it > 0:
-            consec = consec + 1 if abs(tau2 - hist[-2]["tau2"]) < a.tol * tau2 else 0
+            consec = consec + 1 if (abs(tau2 - hist[-2]["tau2"]) < a.tol * tau2
+                                    or (getattr(a, "ll_tol", None) is not None and abs(ll - hist[-2]["loglik"]) < a.ll_tol)) else 0
             if hist[-1]["loglik"] < hist[-2]["loglik"] - 1.0:
                 counters["n_guard"] += 1
                 break
