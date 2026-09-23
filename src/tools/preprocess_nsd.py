@@ -7,6 +7,8 @@ Stages (each writes to --out and can be re-run independently):
   mask    voxel set + per-voxel metadata          -> s{i}_voxel_meta.npz
   coords  MNI (mm) coordinate of every voxel      -> s{i}_coords_mni.npy
   betas   per-session z-scored betas, repeat-avg  -> s{i}_betas_{unique,common}.npy, s{i}_nsdid_{unique,common}.npy
+  trials  per-session z-scored single-trial betas -> s{i}_trials.npy (30000, V), s{i}_trial_meta.npz
+          (not part of "all"; 40-session subjects only)
   feats   backbone embeddings for all 73k images  -> feats_{backbone}_73k.npy
   gt      ridge weights on the 9000 unique images -> s{i}_gt.npy
   layout  files named as the original repo expects (see src/README.md)
@@ -92,7 +94,16 @@ def stage_coords(nsd: Path, out: Path, subj: int):
 
 
 # ---------------------------------------------------------------------------- betas
-def stage_betas(nsd: Path, out: Path, subj: int):
+def _design(nsd: Path, subj: int):
+    exp = sio.loadmat(nsd / "nsddata/experiments/nsd/nsd_expdesign.mat")
+    master = exp["masterordering"].ravel() - 1                  # (30000,) index into subjectim
+    subjectim = exp["subjectim"][subj - 1] - 1                  # (10000,) nsdId (0-based)
+    sharedix = exp["sharedix"].ravel() - 1                      # (1000,)  nsdId (0-based)
+    return master, subjectim, sharedix
+
+
+def _session_betas(nsd: Path, out: Path, subj: int, desc: str):
+    """Yield (sess, b) with b (750, V) float32, z-scored per voxel within the session, nii voxel order."""
     meta = np.load(out / f"s{subj}_voxel_meta.npz")
     shape = tuple(meta["shape"])                                # (x, y, z) as in nii
     mask = np.zeros(shape, bool); mask.ravel()[meta["idx"]] = True
@@ -102,19 +113,11 @@ def stage_betas(nsd: Path, out: Path, subj: int):
     idx_h5 = np.flatnonzero(mask_h5)
     order = np.argsort(np.ravel_multi_index(np.unravel_index(idx_h5, mask_h5.shape)[::-1], shape))
 
-    exp = sio.loadmat(nsd / "nsddata/experiments/nsd/nsd_expdesign.mat")
-    master = exp["masterordering"].ravel() - 1                  # (30000,) index into subjectim
-    subjectim = exp["subjectim"][subj - 1] - 1                  # (10000,) nsdId (0-based)
-    sharedix = exp["sharedix"].ravel() - 1                      # (1000,)  nsdId (0-based)
-
-    V = len(idx_h5)
-    sums = np.zeros((10000, V), np.float64)
-    counts = np.zeros(10000, np.int32)
     bdir = nsd / "nsddata_betas/ppdata" / f"subj{subj:02d}/func1pt8mm" / BETAS_DIR
     # subjects 3/6 have 32 sessions and 4/8 have 30 (others 40): use the sessions that exist
     n_sess = sum((bdir / f"betas_session{k:02d}.hdf5").exists() or (bdir / f"betas_session{k:02d}.nii.gz").exists()
                  for k in range(1, N_SESSIONS + 1))
-    for sess in tqdm(range(1, n_sess + 1), desc=f"[betas] s{subj} ({n_sess} sessions)"):
+    for sess in tqdm(range(1, n_sess + 1), desc=f"[{desc}] s{subj} ({n_sess} sessions)"):
         h5 = bdir / f"betas_session{sess:02d}.hdf5"
         if h5.exists():
             with h5py.File(h5) as f:
@@ -124,10 +127,20 @@ def stage_betas(nsd: Path, out: Path, subj: int):
             b = np.asarray(nib.load(bdir / f"betas_session{sess:02d}.nii.gz").dataobj)
             b = b.reshape(-1, b.shape[-1])[meta["idx"]].T
         b = b.astype(np.float32) / 300.0
-        b = (b - b.mean(0)) / (b.std(0) + 1e-8)                 # z-score per voxel within session
+        yield sess, (b - b.mean(0)) / (b.std(0) + 1e-8)         # z-score per voxel within session
+
+
+def stage_betas(nsd: Path, out: Path, subj: int):
+    master, subjectim, sharedix = _design(nsd, subj)
+    V = len(np.load(out / f"s{subj}_voxel_meta.npz")["idx"])
+    sums = np.zeros((10000, V), np.float64)
+    counts = np.zeros(10000, np.int32)
+    n_sess = 0
+    for sess, b in _session_betas(nsd, out, subj, "betas"):
         trials = master[(sess - 1) * TRIALS_PER_SESSION: sess * TRIALS_PER_SESSION]
         np.add.at(sums, trials, b)
         np.add.at(counts, trials, 1)
+        n_sess = sess
     shown = counts > 0
     if not shown.all():
         # subjects with < 40 sessions: unique images never shown are dropped; common images never shown
@@ -147,6 +160,36 @@ def stage_betas(nsd: Path, out: Path, subj: int):
     np.save(out / f"s{subj}_nsdid_common.npy", subjectim[common])
     print(f"[betas] s{subj}: unique {betas[uniq].shape}, common {betas[common].shape}, "
           f"repeats min/max {counts.min()}/{counts.max()}")
+
+
+# --------------------------------------------------------------------------- trials
+def stage_trials(nsd: Path, out: Path, subj: int):
+    """Single-trial betas (same per-session z-score as stage_betas, no repeat averaging)."""
+    master, subjectim, sharedix = _design(nsd, subj)
+    V = len(np.load(out / f"s{subj}_voxel_meta.npz")["idx"])
+    path = out / f"s{subj}_trials.npy"
+    n_sess = 0
+    for sess, b in _session_betas(nsd, out, subj, "trials"):
+        if sess == 1:
+            trials = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
+                                               shape=(N_SESSIONS * TRIALS_PER_SESSION, V))
+        trials[(sess - 1) * TRIALS_PER_SESSION: sess * TRIALS_PER_SESSION] = b
+        n_sess = sess
+    trials.flush()
+    n = n_sess * TRIALS_PER_SESSION
+    if n_sess < N_SESSIONS:
+        raise RuntimeError(f"s{subj}: {n_sess} sessions; stage_trials supports the 40-session subjects only")
+    img = master[:n]                                            # index into subjectim
+    # rep: 0/1/2 = how many earlier trials showed the same image
+    o = np.argsort(img, kind="stable")
+    first = np.r_[True, img[o][1:] != img[o][:-1]]
+    rep = np.empty(n, np.int8)
+    rep[o] = np.arange(n) - np.maximum.accumulate(np.where(first, np.arange(n), 0))
+    np.savez(out / f"s{subj}_trial_meta.npz", nsdid=subjectim[img].astype(np.int32), rep=rep,
+             session=np.repeat(np.arange(1, n_sess + 1, dtype=np.int8), TRIALS_PER_SESSION),
+             is_common=np.isin(subjectim[img], sharedix))
+    print(f"[trials] s{subj}: {trials.shape}, repeats per image min/max "
+          f"{np.bincount(img).min()}/{np.bincount(img).max()}")
 
 
 # ---------------------------------------------------------------------------- feats
@@ -248,7 +291,8 @@ def main():
     ap.add_argument("--nsd_root", default="data/NSD/data")
     ap.add_argument("--out", default="data/braincorl")
     ap.add_argument("--subjects", type=int, nargs="+", default=[1, 2, 5, 7])
-    ap.add_argument("--stage", default="all", choices=["all", "mask", "coords", "betas", "feats", "gt", "layout"])
+    ap.add_argument("--stage", default="all", choices=["all", "mask", "coords", "betas", "trials", "feats", "gt", "layout"],
+                    help="all = every stage except trials")
     ap.add_argument("--backbone", default="clip_b16")
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--device", default="cuda")
@@ -266,6 +310,8 @@ def main():
         for s in a.subjects: stage_coords(nsd, out, s)
     if run("betas"):
         for s in a.subjects: stage_betas(nsd, out, s)
+    if a.stage == "trials":
+        for s in a.subjects: stage_trials(nsd, out, s)
     if run("feats"):
         stage_feats(nsd, out, a.backbone, a.batch_size, a.device)
     if run("gt"):
