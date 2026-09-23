@@ -12,6 +12,12 @@ mode eb     SFLM-EB: one generative model  B_v | m, j, C = F_m C + eps,  C ~ N(C
             --tau2 search   bracketed root of d loglik / d log tau2 (scipy brentq) with sig2_v profiled by the MacKay
                             fixed point at each tau2, on a random voxel subsample; then sig2_v for all voxels at tau2_hat
                             (docs/survey/sflm_constant_removal_2026-09-23.md §2 A4).
+            --tau2 loso     tau2 by leave-one-training-subject-out ML on the population (fit_loso): the held-out training
+                            subject's full-data C_v^(m) ~ sum_j w_vj N(C_j^(m), tau2 v_m I), EM with the statistics pooled
+                            over the three held-out subjects; the support set only enters through sig2_v (profiled at that
+                            tau2).  Well defined at every n (no n < K degeneracy).  --tau2 loso_m: one tau2_m per mask.
+            --sigma_grid    choose sigma_mm on this grid by the LOSO log evidence (fit_alpha score + fit_loso score); the
+                            hold-out subject enters no choice.
 Constant inventory (docs/sflm_eb_experiments_2026-09-23.md): #6 lam_pop, #9 tau2 init (mackay), #10 sig2 init, #11 stop
 rule (mackay: tol + consecutive), #12 loglik guard (mackay), #13 sig2 floor, #14 df floor, #15 bracket, #16 search_xtol,
 #17 search_vox (+seed), #18 inner_tol, #19 inner_cap.  D5 counters for #12-#14 and the secant clip are written per cell.
@@ -126,6 +132,60 @@ def fit_alpha(qpop, xyz_pop, slices, sigma):
     return float(grid[best]), {f"{float(a):g}": float(v) for a, v in zip(grid, score)}
 
 
+@torch.inference_mode()
+def fit_loso(Cpop, qpop, xyz_pop, slices, sigma, vscale, share=True, iters=100, tol=1e-4, chunk=2048, log=print):
+    """tau2 by leave-one-training-subject-out type-II ML on the population.  For each held-out training subject s and
+    voxel v in s, the full-data coefficients C_v^(m) (K,) are modelled with the prior of the fast stage,
+        C_v^(m) ~ sum_{j not in s} w_vj N(C_j^(m), tau2_m v_m I),   w_vj = normalised MNI kernel (sigma),
+    weighted by the voxel's own full-data mask posterior q_v(m).  EM on tau2 with the sufficient statistics pooled over
+    the three held-out subjects: tau2_m <- sum_v q_v(m) sum_j r_vj ||C_v - C_j||^2 / (v_m K sum_v q_v(m)), r_vj the
+    responsibilities; share=True pools over m as well (one scalar in units of v_m, the fast stage's convention).
+    Returns (tau2 (M,) tensor, info) with info = dict(score = LOSO log evidence sum_v sum_m q_v(m) log p(C_v^(m)) at the
+    estimate, per_subject = tau2 estimated from each held-out subject alone (one final E-step), hist)."""
+    M, K, J = Cpop.shape
+    tau2 = torch.ones(M, device=DEV)
+    pn = (xyz_pop ** 2).sum(1)
+    hist = []
+    for it in range(iters + 1):
+        stat, cnt, score = torch.zeros(M, device=DEV), torch.zeros(M, device=DEV), 0.0
+        stat_s = {}
+        for s, sl in slices.items():
+            keep = torch.ones(J, dtype=torch.bool, device=DEV)
+            keep[sl] = False
+            xyz_o, pn_o = xyz_pop[keep], pn[keep]
+            Cj = [Cpop[m][:, keep].T.contiguous() for m in range(M)]                   # (Jo, K) per mask
+            Cj2 = [(c ** 2).sum(1) for c in Cj]
+            st_s, ct_s = torch.zeros(M, device=DEV), torch.zeros(M, device=DEV)
+            for a in range(sl.start, sl.stop, chunk):
+                b = min(a + chunk, sl.stop)
+                xv = xyz_pop[a:b]
+                logw = -0.5 * ((xv ** 2).sum(1, keepdim=True) - 2 * xv @ xyz_o.T + pn_o[None]) / sigma ** 2
+                logw -= torch.logsumexp(logw, 1, keepdim=True)
+                q = qpop[a:b]
+                for m in range(M):
+                    Cv = Cpop[m][:, a:b].T
+                    D = ((Cv ** 2).sum(1, keepdim=True) - 2 * Cv @ Cj[m].T + Cj2[m][None]).clamp_min(0.0)   # (v, Jo)
+                    pv = tau2[m] * vscale[m]
+                    lg = logw - 0.5 * D / pv - 0.5 * K * torch.log(2 * np.pi * pv)
+                    lse = torch.logsumexp(lg, 1)
+                    score += (q[:, m] * lse).sum().item()
+                    r = torch.exp(lg - lse[:, None])
+                    st_s[m] += (q[:, m] * (r * D).sum(1)).sum() / vscale[m]
+                    ct_s[m] += q[:, m].sum()
+            stat += st_s
+            cnt += ct_s
+            stat_s[s] = (st_s, ct_s)
+        new = (stat.sum() / (K * cnt.sum())).expand(M).clone() if share else stat / (K * cnt)
+        delta = ((new - tau2).abs() / tau2).max().item()
+        hist.append(dict(it=it, score=score, tau2=float(tau2.mean()), tau2_min=float(tau2.min()), tau2_max=float(tau2.max()), delta=delta))
+        log(f"[loso] sigma {sigma:g} it {it} score {score:.1f} tau2 mean {tau2.mean():.5f} min {tau2.min():.5f} max {tau2.max():.5f} max|dtau2|/tau2 {delta:.2e}")
+        if it == iters or delta < tol:
+            break
+        tau2 = new
+    per_subject = {s: float((st.sum() / (K * ct.sum())) if share else (st / (K * ct)).mean()) for s, (st, ct) in stat_s.items()}
+    return tau2, dict(score=score, per_subject=per_subject, hist=hist, iters=len(hist), converged=delta < tol)
+
+
 # ------------------------------------------------------------------------------------------------------ SFLM-EB
 SIG2_FLOOR = 1e-6                                                              # #13
 DF_FLOOR = 1.0                                                                 # #14
@@ -156,6 +216,10 @@ class EB:
             self.eig.append((d, Q, s_hat, (d[:, None] * c_hat ** 2).sum(0), Y, Y2))
         self.n_estep = 0
 
+    def _pv(self, tau2, m):
+        """Prior variance of mask m: tau2 (float, or (M,) tensor for per-mask tau2) in units of vscale[m]."""
+        return (tau2[m] if torch.is_tensor(tau2) else tau2) * self.vscale[m]
+
     def _logw(self, vi):
         """Normalised log MNI-kernel weights (v, J) for voxels vi; independent of m, tau2, sig2."""
         xv = self.xyz_v[vi]
@@ -177,7 +241,7 @@ class EB:
             s2, bb = sig2[sl], self.bb[sl]
             for m in range(M):
                 d, Q, s_hat, cGc, Y, Y2 = self.eig[m]
-                rho = s2 / (tau2 * self.vscale[m])
+                rho = s2 / self._pv(tau2, m)
                 w = 1.0 / (rho[:, None] + d[None])                               # (v, K)
                 sh = s_hat[:, sl].T                                              # (v, K)
                 logdet = n * torch.log(s2) + torch.log1p(d[None] / rho[:, None]).sum(1)
@@ -205,7 +269,7 @@ class EB:
         res, qgam, e_full, mk_num = (torch.zeros(vi.shape[0], device=DEV) for _ in range(4))
         for m in range(M):
             d, Q, s_hat, cGc, Y, Y2 = self.eig[m]
-            rho = s2 / (tau2 * self.vscale[m])
+            rho = s2 / self._pv(tau2, m)
             w = 1.0 / (rho[:, None] + d[None])
             sh = s_hat[:, vi].T
             rc, rc2 = RC[m].T, RC2[m].T                                          # (v, K)
@@ -225,7 +289,7 @@ class EB:
         pred = torch.zeros(self.V, self.Fq.shape[0], device=DEV)
         for m in range(self.M):
             d, Q, s_hat, *_ = self.eig[m]
-            rho = sig2 / (tau2 * self.vscale[m])
+            rho = sig2 / self._pv(tau2, m)
             w = 1.0 / (rho[:, None] + d[None])
             mu = (w * (rho[:, None] * RC[m].T + s_hat.T)) @ Q.T                  # (V, K)
             pred += q[:, m:m + 1] * (mu @ self.Fq[:, m].T)
@@ -339,27 +403,30 @@ def eb_fit_search(eb: EB, a, log):
                       inner_cap_hit=int(sum(k == a.inner_cap for k in inner_used)), grad_all=grad_all, loglik_all=ll_all)
 
 
-def eb_fit_fixed(eb: EB, a, log):
-    """Diagnostic (EV-versus-tau2 curve): sig2_v profiled at the given --tau2_fixed on all voxels, then predict."""
-    a2 = argparse.Namespace(**{**vars(a), "bracket": [a.tau2_fixed, a.tau2_fixed], "search_vox": 0})
+def eb_fit_fixed(eb: EB, a, log, tau2=None):
+    """sig2_v profiled (MacKay fixed point, #18 tolerance, #19 cap) at a fixed tau2 on all voxels, then predict.
+    tau2: float (--tau2 fixed, the EV-versus-tau2 diagnostic) or an (M,) tensor / float from fit_loso (--tau2 loso*)."""
     n, K, V = eb.n, eb.K, eb.V
     allv = torch.arange(V, device=DEV)
     sig2 = eb.bb / n * a.sig2_init_scale
     counters = dict(n_floor=0, n_clamp=0, n_clip=0, n_guard=0)
-    tau2, used = a.tau2_fixed, 0
+    tau2, used = a.tau2_fixed if tau2 is None else tau2, 0
+    t2s = float(tau2.mean()) if torch.is_tensor(tau2) else float(tau2)               # scalar summary for logs / grad
     for k in range(a.inner_cap):
         q, ll, RC, RC2 = eb.estep(tau2, sig2, allv)
         res, qgam, e_full, _ = eb.mstats(tau2, sig2, allv, q, RC, RC2)
         new = _sig2_step(res, n - qgam, counters)
         delta = (torch.log(new) - torch.log(sig2)).abs().max().item()
         sig2, used = new, k + 1
-        log(f"[eb] fixed tau2 {tau2:.5f} inner {k} loglik {ll:.1f} max|dlog sig2| {delta:.2e}")
+        log(f"[eb] fixed tau2 {t2s:.5f} inner {k} loglik {ll:.1f} max|dlog sig2| {delta:.2e}")
         if delta < a.inner_tol:
             break
-    grad = e_full.sum().item() / (2 * tau2) - K * V / 2
+    grad = e_full.sum().item() / (2 * t2s) - K * V / 2 if not torch.is_tensor(tau2) else np.nan
     q, ll, RC, RC2 = eb.estep(tau2, sig2, allv)
     pred = eb.predict(tau2, sig2, q, RC)
-    return pred, dict(tau2=tau2, hist=[dict(loglik=ll, grad=grad)], mask_mass=q.mean(0).tolist(), counters=counters, iters=used,
+    return pred, dict(tau2=t2s, tau2_min=float(tau2.min()) if torch.is_tensor(tau2) else t2s,
+                      tau2_max=float(tau2.max()) if torch.is_tensor(tau2) else t2s,
+                      hist=[dict(loglik=ll, grad=grad)], mask_mass=q.mean(0).tolist(), counters=counters, iters=used,
                       converged=delta < a.inner_tol, sig2_med=sig2.median().item(), n_estep=eb.n_estep, evals=1,
                       bracket_pos=np.nan, bracket_edge=False, inner_max=used, inner_cap_hit=int(used == a.inner_cap),
                       grad_all=grad, loglik_all=ll)
@@ -404,8 +471,13 @@ def main():
     ap.add_argument("--tau2_ratio", type=float, default=0.0227)
     ap.add_argument("--prior_floor", type=float, default=0.1)
     # mode eb
-    ap.add_argument("--tau2", choices=["mackay", "search", "fixed"], default="mackay", help="solver for the shared tau2 (fixed = diagnostic)")
+    ap.add_argument("--tau2", choices=["mackay", "search", "fixed", "loso", "loso_m"], default="mackay",
+                    help="solver for tau2: mackay / search = type-II ML on the support set; fixed = diagnostic; "
+                         "loso = LOSO ML on the population, one scalar (units v_m); loso_m = per mask")
     ap.add_argument("--tau2_fixed", type=float, default=None, help="tau2 value for --tau2 fixed (units of v_m)")
+    ap.add_argument("--sigma_grid", type=float, nargs="*", default=None, help="choose sigma_mm on this grid by the LOSO log evidence")
+    ap.add_argument("--loso_iters", type=int, default=100, help="EM iteration cap of fit_loso")
+    ap.add_argument("--loso_tol", type=float, default=1e-4, help="fit_loso stops when max |d tau2| / tau2 < tol")
     ap.add_argument("--alpha", type=float, default=None, help="override the fitted Dirichlet concentration")
     ap.add_argument("--sig2_init_scale", type=float, default=1.0, help="#10: sig2 init = scale * ||B_v||^2 / n")
     ap.add_argument("--chunk", type=int, default=4096, help="voxels per E-step chunk (memory only)")
@@ -453,7 +525,37 @@ def main():
     U_u = (cache["U_u"].to(DEV) - u_mean) / u_std
     U_q = (cache["U_q"].to(DEV) - u_mean) / u_std
     info = dict(mode=a.mode, args=vars(a))
-    alpha = np.nan
+    alpha, tau2_loso, loso_score = np.nan, None, np.nan
+
+    def loso_fit(sigma):
+        """LOSO fit at one sigma, cached on disk by (sigma, lam_pop, share)."""
+        share = a.tau2 == "loso"
+        cp = out / f"loso_s{sigma:g}_l{a.lam_pop:g}_{'shared' if share else 'permask'}.pt"
+        if cp.exists():
+            d = torch.load(cp)
+            log(f"[loso] sigma {sigma:g} from {cp.name}: score {d['info']['score']:.1f} tau2 mean {d['tau2'].mean():.5f}")
+            return d["tau2"].to(DEV), d["info"]
+        t2, inf = fit_loso(Cpop, qpop, xyz_pop, slices, sigma, vscale, share=share, iters=a.loso_iters, tol=a.loso_tol, log=log)
+        torch.save(dict(tau2=t2.cpu(), info=inf), cp)
+        return t2, inf
+
+    if a.mode == "eb" and a.sigma_grid:
+        vscale = torch.tensor([Cpop[m].var(1).mean().item() for m in range(M)], device=DEV)
+        curve = {}
+        for sg in a.sigma_grid:
+            al, sc = fit_alpha(qpop, xyz_pop, slices, sg)
+            s_alpha = max(sc.values())
+            if a.tau2.startswith("loso"):
+                t2, inf = loso_fit(sg)
+                s_ev = inf["score"]
+            else:
+                s_ev = 0.0
+            curve[f"{sg:g}"] = dict(alpha=al, score_alpha=s_alpha, score_ev=s_ev, score=s_alpha + s_ev)
+            log(f"[sigma] {sg:g} mm: alpha {al:g} score_alpha {s_alpha:.1f} score_ev {s_ev:.1f} total {s_alpha + s_ev:.1f}")
+        best = max(curve, key=lambda k: curve[k]["score"])
+        a.sigma_mm = float(best)
+        info["sigma_curve"], info["sigma_sel"] = curve, a.sigma_mm
+        log(f"[sigma] selected {a.sigma_mm:g} mm by the LOSO log evidence")
 
     if a.mode == "sflm":
         prior = (1 - a.prior_floor) * kernel_average(xyz_v, xyz_pop, qpop, a.sigma_mm) + a.prior_floor / M
@@ -467,6 +569,12 @@ def main():
         vscale = torch.tensor([Cpop[m].var(1).mean().item() for m in range(M)], device=DEV)
         info.update(alpha=alpha, alpha_scores=scores)
         log(f"[eb] alpha {alpha:g}")
+        if a.tau2.startswith("loso"):
+            tau2_loso, inf = loso_fit(a.sigma_mm)
+            loso_score = inf["score"]
+            info.update(loso=inf, tau2_loso=tau2_loso.tolist())
+            log(f"[eb] tau2 loso mean {tau2_loso.mean():.5f} min {tau2_loso.min():.5f} max {tau2_loso.max():.5f} "
+                f"per subject {inf['per_subject']} score {loso_score:.1f} iters {inf['iters']} converged {inf['converged']}")
 
     order = np.random.default_rng(100).permutation(B_u.shape[0])
     rows = []
@@ -491,7 +599,10 @@ def main():
                     diag = dict(mask_mass=q.mean(0).tolist(), counters={})
                 else:
                     eb = EB(U_u[idx], Bc, U_q, Cpop, vscale, log_pi, xyz_v, xyz_pop, a.sigma_mm, chunk=a.chunk)
-                    pred, diag = dict(mackay=eb_fit_mackay, search=eb_fit_search, fixed=eb_fit_fixed)[a.tau2](eb, a, log)
+                    if a.tau2.startswith("loso"):
+                        pred, diag = eb_fit_fixed(eb, a, log, tau2=tau2_loso)
+                    else:
+                        pred, diag = dict(mackay=eb_fit_mackay, search=eb_fit_search, fixed=eb_fit_fixed)[a.tau2](eb, a, log)
                     pred += Bm.T
                     del eb
             torch.cuda.synchronize()
@@ -503,7 +614,8 @@ def main():
                        bracket_edge=diag.get("bracket_edge", False), alpha=alpha, sig2_med=diag.get("sig2_med", np.nan),
                        iters=diag.get("iters", np.nan), evals=diag.get("evals", np.nan), n_estep=diag.get("n_estep", np.nan),
                        converged=diag.get("converged", True), inner_max=diag.get("inner_max", np.nan),
-                       inner_cap_hit=diag.get("inner_cap_hit", 0), lam_pop=a.lam_pop, sigma_mm=a.sigma_mm)
+                       inner_cap_hit=diag.get("inner_cap_hit", 0), lam_pop=a.lam_pop, sigma_mm=a.sigma_mm,
+                       tau2_min=diag.get("tau2_min", np.nan), tau2_max=diag.get("tau2_max", np.nan), loso_score=loso_score)
             row.update({k: diag["counters"].get(k, np.nan) for k in ("n_floor", "n_clamp", "n_clip", "n_guard")})
             row.update({f"ev_{k}": float(ev[good & np.isin(meta["streams"], v)].mean()) for k, v in STREAMS.items()})
             rows.append(row)
