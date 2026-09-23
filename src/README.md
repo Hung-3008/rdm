@@ -26,6 +26,10 @@ src/
     metrics.py           explained_variance, point_mse, normed_cos_similarity
     predict.py           linear_readout, unit_norm
     ridge.py             ridge_cv_brainwise (within-subject baseline)
+  sflm/
+    latent.py            SFLM slow stage: mask_dictionary, GridStore (7x7 CLIP patch grid), LatentMap, SourceReadout, train_latent
+    fast.py              SFLM-EB fast stage (closed form): population(), fit_alpha (LOSO Dirichlet prior), EB (marginal likelihood
+                         E-step over masks x population voxels), eb_fit_mackay (type-II ML for tau2, sig2_v); docs/sflm_eb_experiments_2026-09-23.md
   config/
     load.py              load_config(path, ["key.sub=value", ...])
     braincorl_clip_3090.yaml   paper architecture, single 24 GB GPU
@@ -38,6 +42,10 @@ Mapping to the original scripts: `model.py` -> `model/layers.py` + `model/brainc
 `engine/pl_module.py` (+ `model/checkpoint.py` to load the released checkpoints);
 `dataset.py` -> `dataset/`; `utils.py` -> `utils/`;
 `train_pl_mul_subj.py` -> `train.py`; `test_det.py` -> `eval.py`.
+
+SFLM (shared functional latent map) is not part of the BraInCoRL port: `scripts/sflm_pilot.py` trains the slow stage
+(`src/sflm/latent.py`) and runs the SFLM control fast stage; `scripts/sflm_fast.py` runs the SFLM-EB fast stage
+(`src/sflm/fast.py`, mode `eb --tau2 mackay`) on a saved `latent.pt`; `scripts/sflm_eb_table.py` prints the paired 4-fold table.
 
 ## BraInCoRL training protocol (`scripts/repro_braincorl.sh`)
 
