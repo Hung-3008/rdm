@@ -31,7 +31,11 @@ def main():
     ap.add_argument("--tag", default="A_cont")
     ap.add_argument("--num_ic", type=int, nargs="+", default=[30, 100, 300, 1000])
     ap.add_argument("--reps", type=int, nargs="+", default=[0, 1, 2])
-    ap.add_argument("--sigma_mm", type=float, default=10.0)
+    ap.add_argument("--sigma_mm", type=float, default=10.0, help="kernel width; with --sigma_grid, the starting value")
+    ap.add_argument("--sigma_grid", type=float, nargs="*", default=None,
+                    help="type-II ML for sigma_mm on the support set: fit at --sigma_mm, profile the evidence on this grid, refit at the "
+                         "argmax (repeated --sigma_rounds times); the profile is logged either way")
+    ap.add_argument("--sigma_rounds", type=int, default=2)
     ap.add_argument("--lam_pop", type=float, default=1.0)
     ap.add_argument("--jchunk", type=int, default=128)
     ap.add_argument("--sig2_init_scale", type=float, default=1.0)
@@ -82,9 +86,23 @@ def main():
             t0 = time.time()
             Bs = B_u[idx]
             Bm = Bs.mean(0, keepdim=True)
+            sigma_sel, profiles = a.sigma_mm, []
             with torch.inference_mode():
                 eb = EBcont(Z_u[idx], Bs - Bm, Z_q, pop, vscale, xyz_v, a.sigma_mm, jchunk=a.jchunk)
                 pred, diag = eb_fit_mackay_cont(eb, a, log)
+                if a.sigma_grid:
+                    for rnd in range(a.sigma_rounds):
+                        prof = eb.sigma_profile(a.sigma_grid)
+                        best = max(prof, key=prof.get)
+                        profiles.append(dict(sigma=sigma_sel, tau2=diag["tau2"], profile=prof, argmax=best))
+                        log(f"[sigma] round {rnd} at sigma {sigma_sel:g} tau2 {diag['tau2']:.5f}: " + " ".join(f"{k:g}:{v:.1f}" for k, v in prof.items()) + f" -> {best:g}")
+                        if best == sigma_sel:
+                            break
+                        sigma_sel = best
+                        eb.set_sigma(sigma_sel)
+                        pred, diag = eb_fit_mackay_cont(eb, a, log)
+                    diag["sigma_profiles"] = profiles
+                    diag["sigma_edge"] = bool(sigma_sel in (min(a.sigma_grid), max(a.sigma_grid)))
                 pred += Bm.T
                 del eb
             torch.cuda.synchronize()
@@ -93,12 +111,13 @@ def main():
             np.save(out / f"{a.tag}_n={n}_rep={rep}_ev.npy", ev.astype(np.float32))
             row = dict(tag=a.tag, mode="eb_cont", n=n, rep=rep, ev=float(ev[good].mean()), r=float(r[good].mean()), ev_all=float(ev.mean()),
                        sec=sec, tau2=diag["tau2"], alpha=np.nan, sig2_med=diag["sig2_med"], iters=diag["iters"], evals=np.nan,
-                       n_estep=diag["n_estep"], converged=diag["converged"], lam_pop=a.lam_pop, sigma_mm=a.sigma_mm,
+                       n_estep=diag["n_estep"], converged=diag["converged"], lam_pop=a.lam_pop, sigma_mm=sigma_sel,
+                       sigma_start=a.sigma_mm, sigma_edge=diag.get("sigma_edge", False), sigma_rounds=len(profiles),
                        r_max_med=diag["r_max_med"])
             row.update({k: diag["counters"][k] for k in ("n_floor", "n_clamp", "n_clip", "n_guard")})
             row.update({f"ev_{k}": float(ev[good & np.isin(meta["streams"], v)].mean()) for k, v in STREAMS.items()})
             info[f"diag_n={n}_rep={rep}"] = diag
-            log(f"[{a.tag}] n={n} rep={rep} ev={row['ev']:.4f} r={row['r']:.4f} early={row['ev_early']:.4f} tau2={row['tau2']:.5f} "
+            log(f"[{a.tag}] n={n} rep={rep} ev={row['ev']:.4f} r={row['r']:.4f} early={row['ev_early']:.4f} tau2={row['tau2']:.5f} sigma={sigma_sel:g} "
                 f"iters={row['iters']} r_max_med={row['r_max_med']:.3f} floor/clamp/clip/guard={row['n_floor']}/{row['n_clamp']}/{row['n_clip']}/{row['n_guard']} {sec:.0f}s")
             write_rows(res_path, [row])
     with open(out / f"{a.tag}_info.json", "w") as f:

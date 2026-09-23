@@ -43,11 +43,12 @@ def build_cache_cont(H: int, path: Path, latent: str):
 
 
 @torch.inference_mode()
-def population_cont(H, cache, lam_pop: float, jchunk: int = 512):
+def population_cont(H, cache, lam_pop: float, jchunk: int = 512, subjects=None):
     """Per training voxel j (ncsnr > 0.2): mask A_j (P,), channel mean/std (K,) over the subject's 9,000 images, full-data
-    ridge coefficients C_j (K,) (lambda = lam_pop) and MNI xyz.  Returns dict of (J, .) tensors on DEV."""
+    ridge coefficients C_j (K,) (lambda = lam_pop) and MNI xyz.  Returns dict of (J, .) tensors on DEV.
+    subjects: which training subjects form the population (default TRAIN[H]; a subset for leave-one-training-subject-out)."""
     A, mean, std, C, xyz = [], [], [], [], []
-    for s in TRAIN[H]:
+    for s in (TRAIN[H] if subjects is None else subjects):
         good = np.load(DATA / f"s{s}_voxel_meta.npz")["ncsnr"] > 0.2
         mu, sig = cache["rf"][s]
         As = gaussian_dictionary(mu[good].to(DEV), sig[good].to(DEV))                       # (J_s, P)
@@ -97,12 +98,34 @@ class EBcont:
         pn = (pop["xyz"] ** 2).sum(1)
         self.xv2 = (xyz_v ** 2).sum(1, keepdim=True)
         self.xyz_v, self.pn, self.sigma = xyz_v, pn, sigma
-        logZ = torch.full((self.V,), -float("inf"), device=DEV)
-        for a in range(0, self.J, jchunk):
-            logZ = torch.logaddexp(logZ, torch.logsumexp(self._logw_raw(a), 1))
-        self.logZ = logZ
-        self.R = torch.empty(self.V, self.J, device=DEV)
+        self.logZ = self._logZ(sigma)
+        self.R = torch.empty(self.V, self.J, device=DEV)                 # responsibilities of the last E-step
+        self.LP = torch.empty(self.V, self.J, device=DEV)                # log p(B_v | j) of the last E-step (sigma-free)
         self.n_estep = 0
+
+    def _logZ(self, sigma):
+        logZ = torch.full((self.V,), -float("inf"), device=DEV)
+        for a in range(0, self.J, self.jchunk):
+            logZ = torch.logaddexp(logZ, torch.logsumexp(self._logw_raw(a, sigma), 1))
+        return logZ
+
+    @torch.inference_mode()
+    def set_sigma(self, sigma):
+        self.sigma, self.logZ = sigma, self._logZ(sigma)
+
+    @torch.inference_mode()
+    def sigma_profile(self, grid):
+        """Log evidence sum_v log sum_j w_vj(sigma) p(B_v | j) for each sigma in grid, at the (tau2, sig2) of the last E-step:
+        only the kernel weights change, so no E-step is repeated.  Returns {sigma: evidence}."""
+        out = {}
+        for sg in grid:
+            logZ = self._logZ(sg)
+            ev = torch.full((self.V,), -float("inf"), device=DEV)
+            for a in range(0, self.J, self.jchunk):
+                sl = slice(a, a + self.jchunk)
+                ev = torch.logaddexp(ev, torch.logsumexp(self.LP[:, sl] + self._logw_raw(a, sg) - logZ[:, None], 1))
+            out[float(sg)] = ev.sum().item()
+        return out
 
     def _F(self, a):
         """Standardised support channels of candidates a:a+jchunk, (Jc, n, K)."""
@@ -110,9 +133,9 @@ class EBcont:
         F = torch.einsum("npk,jp->jnk", self.Z_s, self.pop["A"][sl])
         return (F - self.pop["mean"][sl][:, None]) / self.pop["std"][sl][:, None]
 
-    def _logw_raw(self, a):
+    def _logw_raw(self, a, sigma=None):
         xj = self.pop["xyz"][a:a + self.jchunk]
-        return -0.5 * (self.xv2 - 2 * self.xyz_v @ xj.T + self.pn[a:a + self.jchunk][None]) / self.sigma ** 2      # (V, Jc)
+        return -0.5 * (self.xv2 - 2 * self.xyz_v @ xj.T + self.pn[a:a + self.jchunk][None]) / (self.sigma if sigma is None else sigma) ** 2
 
     @torch.inference_mode()
     def estep_mstats(self, tau2, sig2):
@@ -129,7 +152,8 @@ class EBcont:
             w = 1.0 / (rho[None, None] + d)                                                    # (Jc, K, V)
             logdet = n * torch.log(sig2)[None] + torch.log1p(d / rho[None, None]).sum(1)      # (Jc, V)
             quad = self.bb[None] - 2 * (s * c).sum(1) + self.cGc[sl][:, None] - (w * (s - d * c) ** 2).sum(1)
-            self.R[:, sl] = (self._logw_raw(a) - self.logZ[:, None]) + (-0.5 * (logdet + quad / sig2[None])).T
+            self.LP[:, sl] = (-0.5 * (logdet + quad / sig2[None])).T
+            self.R[:, sl] = self.LP[:, sl] + (self._logw_raw(a) - self.logZ[:, None])
         lse = torch.logsumexp(self.R, 1)
         self.R -= lse[:, None]
         self.R.exp_()
