@@ -30,7 +30,7 @@ src/
     latent.py            SFLM slow stage: mask_dictionary, GridStore (7x7 CLIP patch grid), LatentMap, SourceReadout, train_latent
     fast.py              SFLM-EB fast stage (closed form): population(), fit_alpha (LOSO Dirichlet prior), EB (marginal likelihood
                          E-step over masks x population voxels), eb_fit_mackay (type-II ML for tau2, sig2_v); docs/sflm_eb_experiments_2026-09-23.md
-    fast_cont.py         option A fast stage: GaussianReadout RFs of the population voxels as candidates (EBcont, no mask dictionary),
+    fast_cont.py         default fast stage (A_cont): GaussianReadout RFs of the population voxels as candidates (EBcont, no mask dictionary),
                          eb_fit_mackay_cont; docs/sflm_eb_experiments_2026-09-23.md part 3
   config/
     load.py              load_config(path, ["key.sub=value", ...])
@@ -45,11 +45,12 @@ Mapping to the original scripts: `model.py` -> `model/layers.py` + `model/brainc
 `dataset.py` -> `dataset/`; `utils.py` -> `utils/`;
 `train_pl_mul_subj.py` -> `train.py`; `test_det.py` -> `eval.py`.
 
-SFLM (shared functional latent map) is not part of the BraInCoRL port: `scripts/sflm_pilot.py` trains the slow stage
-(`src/sflm/latent.py`) and runs the SFLM control fast stage; `scripts/sflm_fast.py` runs the SFLM-EB fast stage
-(`src/sflm/fast.py`, mode `eb --tau2 mackay`) on a saved `latent.pt`; `scripts/sflm_eb_table.py` prints the paired 4-fold table. Option A (continuous receptive fields, the current best):
-`scripts/sflm_latent_gauss.py` trains the gauss slow stage (`GaussianReadout`) and `scripts/sflm_fast_cont.py` runs the
-continuous-candidate fast stage (`src/sflm/fast_cont.py`).
+SFLM (shared functional latent map) is not part of the BraInCoRL port. Default version, A_cont (continuous receptive
+fields): `scripts/sflm_latent_gauss.py` trains the gauss slow stage (`GaussianReadout`), `scripts/sflm_fast_cont.py` runs the
+continuous-candidate fast stage (`src/sflm/fast_cont.py`; defaults = the 4-fold A_cont run: sigma_mm 10, ll_tol 0.01,
+guard stop), and `scripts/sflm_eb_table.py` prints the paired 4-fold table of A_cont against eb_mackay. Reference versions:
+`scripts/sflm_pilot.py` trains the dictionary slow stage (`src/sflm/latent.py`) and runs the SFLM control fast stage;
+`scripts/sflm_fast.py` runs the dictionary SFLM-EB fast stage (`src/sflm/fast.py`, mode `eb --tau2 mackay`).
 
 ## BraInCoRL training protocol (`scripts/repro_braincorl.sh`)
 

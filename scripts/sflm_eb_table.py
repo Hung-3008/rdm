@@ -1,6 +1,6 @@
-"""Paired 4-fold table for the SFLM-EB fast stage (scripts/sflm_fast.py) against the SFLM reference.
+"""Paired 4-fold table for the SFLM-EB fast stage (scripts/sflm_fast_cont.py, scripts/sflm_fast.py) against a reference arm.
 
-    python scripts/sflm_eb_table.py [--out outputs/sflm_eb] [--ref sflm_default] [--tag eb_mackay]
+    python scripts/sflm_eb_table.py [--out outputs/sflm_ab] [--tag A_cont] [--ref eb_mackay] [--ref_out outputs/sflm_eb]
 
 Per (fold, n): mean EV of both arms over the repeats present in both, the mean paired difference (same support indices by
 construction), the number of positive differences; then the mean over folds per n and the acceptance rule of
@@ -14,10 +14,10 @@ import numpy as np
 import pandas as pd
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--out", default="outputs/sflm_eb")
-ap.add_argument("--ref", default="sflm_default")
-ap.add_argument("--tag", default="eb_mackay")
-ap.add_argument("--ref_out", default=None, help="directory of the reference results (default --out)")
+ap.add_argument("--out", default="outputs/sflm_ab")
+ap.add_argument("--ref", default="eb_mackay")
+ap.add_argument("--tag", default="A_cont")
+ap.add_argument("--ref_out", default="outputs/sflm_eb", help="directory of the reference results")
 ap.add_argument("--folds", type=int, nargs="+", default=[1, 2, 5, 7])
 a = ap.parse_args()
 pd.set_option("display.width", 220)

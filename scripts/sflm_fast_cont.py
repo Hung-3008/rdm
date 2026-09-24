@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--em_iters", type=int, default=200)
     ap.add_argument("--tol", type=float, default=1e-3)
     ap.add_argument("--conv_consec", type=int, default=5)
-    ap.add_argument("--ll_tol", type=float, default=None, help="#11 alt: an iteration also counts as converged when |d loglik| < ll_tol (nat)")
+    ap.add_argument("--ll_tol", type=float, default=0.01, help="#11 alt: an iteration also counts as converged when |d loglik| < ll_tol (nat)")
     ap.add_argument("--tau2_init", type=float, default=1.0)
     ap.add_argument("--guard", choices=["stop", "fallback"], default="stop", help="#12: on a log-likelihood decrease > 1 nat, stop (pilot) or fall back to the plain fixed-point step")
     a = ap.parse_args()
