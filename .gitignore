@@ -21,3 +21,5 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 notebooks/
+paper/
+scripts/
