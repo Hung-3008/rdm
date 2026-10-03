@@ -43,17 +43,23 @@ def build_cache_cont(H: int, path: Path, latent: str):
 
 
 @torch.inference_mode()
-def population_cont(H, cache, lam_pop: float, jchunk: int = 512, subjects=None):
+def population_cont(H, cache, lam_pop: float, jchunk: int = 512, subjects=None, data=None):
     """Per training voxel j (ncsnr > 0.2): mask A_j (P,), channel mean/std (K,) over the subject's 9,000 images, full-data
     ridge coefficients C_j (K,) (lambda = lam_pop) and MNI xyz.  Returns dict of (J, .) tensors on DEV.
-    subjects: which training subjects form the population (default TRAIN[H]; a subset for leave-one-training-subject-out)."""
+    subjects: which training subjects form the population (default TRAIN[H]; a subset for leave-one-training-subject-out).
+    data: {subject: (ncsnr > 0.2 mask (V,), betas (N, V) float32 of the images of cache["Z_tr"], MNI xyz (V, 3))} in place of
+    the NSD files."""
     A, mean, std, C, xyz = [], [], [], [], []
     for s in (TRAIN[H] if subjects is None else subjects):
-        good = np.load(DATA / f"s{s}_voxel_meta.npz")["ncsnr"] > 0.2
+        if data is None:
+            good = np.load(DATA / f"s{s}_voxel_meta.npz")["ncsnr"] > 0.2
+            B, xyz_s = np.load(DATA / f"s{s}_betas_unique.npy"), np.load(DATA / f"s{s}_coords_mni.npy")
+        else:
+            good, B, xyz_s = data[s]
         mu, sig = cache["rf"][s]
         As = gaussian_dictionary(mu[good].to(DEV), sig[good].to(DEV))                       # (J_s, P)
         Z = cache["Z_tr"][s].to(DEV)                                                        # (N, P, K)
-        B = torch.from_numpy(np.load(DATA / f"s{s}_betas_unique.npy")).to(DEV)[:, good]
+        B = torch.from_numpy(B).to(DEV)[:, good]
         B = B - B.mean(0, keepdim=True)
         K = Z.shape[2]
         I = torch.eye(K, device=DEV)
@@ -68,9 +74,30 @@ def population_cont(H, cache, lam_pop: float, jchunk: int = 512, subjects=None):
             mean.append(m)
             std.append(sd)
         A.append(As)
-        xyz.append(torch.from_numpy(np.load(DATA / f"s{s}_coords_mni.npy").astype(np.float32)).to(DEV)[good])
+        xyz.append(torch.from_numpy(xyz_s.astype(np.float32)).to(DEV)[good])
         del Z, B
     return dict(A=torch.cat(A), mean=torch.cat(mean), std=torch.cat(std), C=torch.cat(C), xyz=torch.cat(xyz))
+
+
+@torch.inference_mode()
+def prior_predict(pop, xyz_v, sigma, Z_q, jchunk=256):
+    """(V, Q) population prior of the new subject at K = 0 (M0 of scripts/sflm_inpaint_cont.py): posterior at n = 0,
+    responsibilities = normalised MNI kernel w_vj (sigma mm), coefficients = C_j; y0_v(x) = sum_j w_vj u_j(x)' C_j."""
+    xyz_p, pn, xv2 = pop["xyz"], (pop["xyz"] ** 2).sum(1), (xyz_v ** 2).sum(1, keepdim=True)
+    J, P, K = pop["A"].shape[0], pop["A"].shape[1], pop["C"].shape[1]
+    logZ = torch.full((xyz_v.shape[0],), -float("inf"), device=DEV)
+    for a in range(0, J, jchunk):
+        lw = -0.5 * (xv2 - 2 * xyz_v @ xyz_p[a:a + jchunk].T + pn[a:a + jchunk][None]) / sigma ** 2
+        logZ = torch.logaddexp(logZ, torch.logsumexp(lw, 1))
+    W = torch.zeros(xyz_v.shape[0], P * K, device=DEV)
+    off = torch.zeros(xyz_v.shape[0], device=DEV)
+    for a in range(0, J, jchunk):
+        sl = slice(a, a + jchunk)
+        w = torch.exp(-0.5 * (xv2 - 2 * xyz_v @ xyz_p[sl].T + pn[sl][None]) / sigma ** 2 - logZ[:, None])  # (V, Jc)
+        cs = pop["C"][sl] / pop["std"][sl]                                                                  # (Jc, K)
+        W += w @ torch.einsum("jp,jk->jpk", pop["A"][sl], cs).reshape(-1, P * K)
+        off += w @ (pop["mean"][sl] * cs).sum(1)
+    return (Z_q.reshape(Z_q.shape[0], -1) @ W.T).T - off[:, None]
 
 
 class EBcont:
@@ -197,13 +224,38 @@ class EBcont:
             off += torch.einsum("jv,jk,jkv->v", r, self.pop["mean"][sl], ms)
         return torch.einsum("qpk,vpk->vq", self.Z_q, W) - off[:, None]
 
+    @torch.inference_mode()
+    def predict_var(self, tau2, sig2, jsmall=16):
+        """(V, Q) posterior predictive variance with the responsibilities of the last E-step (docs/experiment_plan_2026-09-26.md
+        E4): sum_j r_vj [f_j(x)' Sigma_vj f_j(x) + (m_vj(x) - m_v(x))^2] + sig2_v + sig2_v / n, with Sigma_vj = sig2_v Q_j
+        diag(1 / (d_j + rho_v)) Q_j' the posterior covariance of the coefficients under candidate j, f_j(x) the standardised query
+        channels, m_vj(x) = f_j(x)' mu_vj; the last term is the variance of the support mean added back to the prediction."""
+        rho = sig2 / (tau2 * self.vscale)
+        var, m1, m2 = (torch.zeros(self.V, self.Z_q.shape[0], device=DEV) for _ in range(3))
+        for a in range(0, self.J, jsmall):
+            sl = slice(a, a + jsmall)
+            Fq = torch.einsum("qpk,jp->jqk", self.Z_q, self.pop["A"][sl])
+            Fq = (Fq - self.pop["mean"][sl][:, None]) / self.pop["std"][sl][:, None]            # (Js, Q, K)
+            g = torch.einsum("jkl,jqk->jlq", self.Q[sl], Fq)                                  # Q_j' f_j(x)
+            F = torch.einsum("npk,jp->jnk", self.Z_s, self.pop["A"][sl])
+            F = (F - self.pop["mean"][sl][:, None]) / self.pop["std"][sl][:, None]
+            s = torch.einsum("jkl,jkv->jlv", self.Q[sl], torch.einsum("jnk,nv->jkv", F, self.Bc))
+            d, c = self.d[sl][:, :, None], self.c[sl][:, :, None]
+            w = 1.0 / (rho[None, None] + d)                                                    # (Js, K, V)
+            r = self.R[:, sl].T                                                                # (Js, V)
+            var += torch.einsum("jlq,jlv->vq", g ** 2, w * r[:, None]) * sig2[:, None]
+            m = torch.einsum("jlq,jlv->jvq", g, w * (rho[None, None] * c + s))                 # m_vj(x)
+            m1 += torch.einsum("jv,jvq->vq", r, m)
+            m2 += torch.einsum("jv,jvq->vq", r, m ** 2)
+        return var + (m2 - m1 ** 2).clamp_min(0) + (sig2 * (1 + 1.0 / self.n))[:, None]
+
 
 def eb_fit_mackay_cont(eb: EBcont, a, log):
     """eb_fit_mackay of src/sflm/fast.py on an EBcont (same constants: #9-#14)."""
     n, K, V = eb.n, eb.K, eb.V
     sig2 = eb.bb / n * a.sig2_init_scale
     tau2 = a.tau2_init
-    counters = dict(n_floor=0, n_clamp=0, n_clip=0, n_guard=0)
+    counters = dict(n_floor=0, n_clamp=0, n_clip=0, n_guard=0, n_tau2_zero=0)
     hist, sec, consec, prev, use_secant = [], [], 0, None, True
     for it in range(a.em_iters + 1):
         ll, res, qgam, e_full, mk_num = eb.estep_mstats(tau2, sig2)
@@ -234,10 +286,13 @@ def eb_fit_mackay_cont(eb: EBcont, a, log):
                 raw = -grad / slope
                 counters["n_clip"] += int(abs(raw) > 2.0)
                 tau2_new = float(np.exp(x + float(np.clip(raw, -2.0, 2.0))))
+        if not tau2_new > 0:        # tau2 underflowed to 0 at the tau2 -> 0 boundary (n < K): keep the last positive tau2
+            counters["n_tau2_zero"] += 1
+            break
         sec.append((x, grad))
         use_secant = True
         tau2 = tau2_new
         sig2 = _sig2_step(res, n - qgam, counters)
     pred = eb.predict(tau2, sig2)
     return pred, dict(tau2=tau2, hist=hist, counters=counters, iters=len(hist), converged=bool(consec >= a.conv_consec),
-                      sig2_med=sig2.median().item(), n_estep=eb.n_estep, r_max_med=eb.R.max(1).values.median().item())
+                      sig2_med=sig2.median().item(), n_estep=eb.n_estep, r_max_med=eb.R.max(1).values.median().item(), sig2=sig2)

@@ -120,13 +120,23 @@ def split_8400_600(n_subj: int, seed: int = 0, n_img: int = 9000, n_val: int = 6
     return out
 
 
-def train_latent(train_subj, store, A, a, out: Path, readout: str = "dict"):
+def train_latent(train_subj, store, A, a, out: Path, readout: str = "dict", data=None):
     """readout "dict": SourceReadout over the mask dictionary A (M, P); "gauss": GaussianReadout (continuous RF per voxel,
-    A unused).  latent.pt stores the latent map; with "gauss" also rf = {subject: (mu (V, 2), sigma (V,))} at the best epoch."""
-    betas = [torch.from_numpy(np.load(DATA / f"s{s}_betas_unique.npy")).to(DEV) for s in train_subj]
-    X = [store(np.load(DATA / f"s{s}_nsdid_unique.npy")) for s in train_subj]
-    split = split_8400_600(len(train_subj))
-    samp = torch.cat([x[torch.randperm(x.shape[0], device=DEV)[:700]] for x in X]).float().reshape(-1, X[0].shape[-1])
+    A unused).  latent.pt stores the latent map; with "gauss" also rf = {subject: (mu (V, 2), sigma (V,))} at the best epoch.
+    data: {subject: (grid features (N, 49, in_dim) float16 on DEV or on the CPU (batches are moved to DEV), betas (N, V) float32
+    on DEV, (train idx, val idx))} in place of the NSD files and split_8400_600 (store unused).  An epoch has
+    min_k(n_train_k) // batch steps."""
+    if data is None:
+        betas = [torch.from_numpy(np.load(DATA / f"s{s}_betas_unique.npy")).to(DEV) for s in train_subj]
+        X = [store(np.load(DATA / f"s{s}_nsdid_unique.npy")) for s in train_subj]
+        split = split_8400_600(len(train_subj))
+    else:
+        X, betas, split = ([data[s][i] for s in train_subj] for i in range(3))
+    n_steps = min(len(tr) for tr, _ in split) // a.batch
+
+    def grid_rows(k, idx):                                                 # rows idx of X[k] on DEV (X[k] may stay on the CPU)
+        return X[k][idx.to(X[k].device) if torch.is_tensor(idx) else idx].to(DEV)
+    samp = torch.cat([grid_rows(k, torch.randperm(x.shape[0], device=DEV)[:700]) for k, x in enumerate(X)]).float().reshape(-1, X[0].shape[-1])
     g = LatentMap(X[0].shape[-1], a.hidden, a.K, samp.mean(0), samp.std(0).clamp_min(1e-3)).to(DEV)
     if readout == "dict":
         heads = nn.ModuleList([SourceReadout(b.shape[1], A.shape[0], a.K) for b in betas]).to(DEV)
@@ -147,7 +157,7 @@ def train_latent(train_subj, store, A, a, out: Path, readout: str = "dict"):
         with torch.no_grad():
             evs = []
             for k, (_, va) in enumerate(split):
-                pred = torch.cat([head(k, g(X[k][va[i:i + 200]])) for i in range(0, len(va), 200)])
+                pred = torch.cat([head(k, g(grid_rows(k, va[i:i + 200]))) for i in range(0, len(va), 200)])
                 evs.append(explained_variance(pred.T, betas[k][va].T).mean().item())
         g.train()
         return float(np.mean(evs)), evs
@@ -156,19 +166,19 @@ def train_latent(train_subj, store, A, a, out: Path, readout: str = "dict"):
     for ep in range(a.max_epochs):
         perms = [torch.from_numpy(np.random.permutation(tr)).to(DEV) for tr, _ in split]
         tot = 0.0
-        for i in range(len(perms[0]) // a.batch):
+        for i in range(n_steps):
             loss = 0.0
             for k in range(len(train_subj)):
                 idx = perms[k][i * a.batch:(i + 1) * a.batch]
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    Z = g(X[k][idx])
+                    Z = g(grid_rows(k, idx))
                 loss = loss + torch.mean((head(k, Z.float()) - betas[k][idx]) ** 2)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             tot += loss.item()
         ev, evs = val_ev()
-        rows.append(dict(epoch=ep, loss=tot / (len(perms[0]) // a.batch), val_ev=ev, sec=time.time() - t0))
+        rows.append(dict(epoch=ep, loss=tot / n_steps, val_ev=ev, sec=time.time() - t0))
         print(f"[latent] epoch {ep:3d} loss {rows[-1]['loss']:.4f} val_ev {ev:.4f} " + " ".join(f"{v:.4f}" for v in evs), flush=True)
         if ev > best:
             best, best_ep = ev, ep
@@ -182,7 +192,7 @@ def train_latent(train_subj, store, A, a, out: Path, readout: str = "dict"):
     g.load_state_dict(torch.load(out / "latent.pt")["state"])
     g.eval()
     with torch.no_grad():                                                  # pooled channels of every training image
-        U = [torch.cat([torch.einsum("mp,bpk->bmk", A, g(x[i:i + 500])) for i in range(0, x.shape[0], 500)]) for x in X] if A is not None else None
+        U = [torch.cat([torch.einsum("mp,bpk->bmk", A, g(x[i:i + 500].to(DEV))) for i in range(0, x.shape[0], 500)]) for x in X] if A is not None else None
     del X
     torch.cuda.empty_cache()
     return g, U, betas, dict(best_val_ev=best, best_epoch=best_ep, train_sec=time.time() - t0)

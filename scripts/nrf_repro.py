@@ -15,6 +15,7 @@ Stages (run from the repo root):
   feats  --subjects 1 2 5 7        CLIP layer-3/6 tokens + image embedding for the 10,000 images of each subject
   base   --subjects 1 2 5 7        one single-subject NRF per subject (shared by the folds that use it as a source)
   ft     --holdout 1 2 5 7         finetune the 3 source models on each support set, save support / test predictions
+  scratch --holdout 1 2 5 7        one NRF from random initialisation per support set (paper_plan.md §8.2 baseline)
   table  --holdout 1 2 5 7         voxel-wise regression ensemble (NRF 3.2), EV / Pearson on ncsnr > 0.2, results.csv
 """
 import argparse
@@ -30,9 +31,11 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 NRF = REPO / "references/NRF"
 sys.path.insert(0, str(NRF))
+sys.path.insert(0, str(REPO))
 from model.Feature_merger import Feature_merger  # noqa: E402
 from model.nrf_encoder import NRF_Encoder  # noqa: E402
 from train.training_utils import compute_loss, gaussian_fourier_feature  # noqa: E402
+from src.sflm.fast import support_offset  # noqa: E402
 
 CFG = yaml.safe_load((NRF / "training_config.yaml").read_text())
 TRAIN = {1: [2, 5, 7], 2: [1, 5, 7], 5: [1, 2, 7], 7: [1, 2, 5]}
@@ -41,10 +44,11 @@ DEV = torch.device("cuda")
 
 # ── data ──
 
-def load_subject(a, s):
+def load_subject(a, s, shift=0.0):
     root = Path(a.root)
     rows = np.load(root / f"s{s}_stim_rows.npz")
     xyz = np.load(root / f"s{s}_coords_mni.npy").astype(np.float32)
+    xyz[:, 0] += shift                                                          # E3 ablation, mm on x (--coord_shift)
     xyz = np.stack([xyz[:, 0] / 182 + 92 / 182, xyz[:, 1] / 218 + 126 / 218, xyz[:, 2] / 182 + 72 / 182], 1)  # NRF dataloader
     return dict(rows=rows, coords=torch.from_numpy(xyz).to(DEV),
                 early=np.load(Path(a.feats) / f"s{s}_early.npy", mmap_mode="r"),
@@ -98,22 +102,25 @@ def pearson_cols(p, t):
     return torch.nan_to_num(r)
 
 
-def fit(a, merger, mlp, embed, coords, trn, val, out, max_epochs, tag):
-    """NRFTrainer.train: AdamW, per-image voxel subsampling, early stopping on the median val Pearson."""
+def fit(a, merger, mlp, embed, coords, trn, val, out, max_epochs, tag, min_epochs=0):
+    """NRFTrainer.train: AdamW, per-image voxel subsampling, early stopping on the median val Pearson (patience counted
+    from epoch min_epochs on); val None = train max_epochs epochs and keep the last one."""
     tc = CFG["training"]
     opt = torch.optim.AdamW(list(mlp.parameters()) + list(merger.parameters()), lr=a.lr, weight_decay=tc["wdecay"])
-    (early, higher, beta), (v_early, v_higher, v_beta) = trn, val
-    beta, v_beta = beta.to(DEV), v_beta.to(DEV)
+    (early, higher, beta), (v_early, v_higher, v_beta) = trn, val or (None, None, None)
+    beta, v_beta = beta.to(DEV), v_beta if val is None else v_beta.to(DEV)
     best, best_ep, bad, start = -1.0, -1, 0, 0
     last = out / "last.pt"
     if a.resume and last.exists():
         ck = torch.load(last, map_location=DEV)
         mlp.load_state_dict(ck["mlp"]), merger.load_state_dict(ck["merger"]), opt.load_state_dict(ck["opt"])
         best, best_ep, bad, start = ck["best"], ck["best_ep"], ck["bad"], ck["epoch"] + 1
-        torch.set_rng_state(ck["rng"]), torch.cuda.set_rng_state(ck["cuda_rng"])
+        torch.set_rng_state(ck["rng"].cpu()), torch.cuda.set_rng_state(ck["cuda_rng"].cpu())
     V, nv = len(coords), tc["num_voxels"]
     for ep in range(start, max_epochs):
-        if bad >= tc["patience"]:
+        if min_epochs and ep == min_epochs:
+            bad = 0                                                  # patience counts from min_epochs on
+        if bad >= tc["patience"] and ep >= min_epochs:
             break
         merger.train(), mlp.train()
         t0, losses = time.time(), []
@@ -131,8 +138,11 @@ def fit(a, merger, mlp, embed, coords, trn, val, out, max_epochs, tag):
                 total += loss.item()
             opt.step()
             losses.append(total)
-        r = pearson_cols(predict(merger, mlp, embed, v_early, v_higher, coords), v_beta).median().item()
-        improved = r > best
+        if val is None:
+            r, improved = float("nan"), True
+        else:
+            r = pearson_cols(predict(merger, mlp, embed, v_early, v_higher, coords), v_beta).median().item()
+            improved = r > best
         if improved:
             best, best_ep, bad = r, ep, 0
             torch.save(dict(mlp=mlp.state_dict(), merger=merger.state_dict(), epoch=ep, val_corr=r), out / "best.pt")
@@ -192,23 +202,34 @@ def stage_base(a):
 
 
 def support_sets(ns, reps):
-    order, start = np.random.default_rng(100).permutation(9000), 0
+    """Support sets of SFLM (src.sflm.fast.support_offset) for any n; the same slices as before for n in {30, 100, 300, 1000}."""
+    order = np.random.default_rng(100).permutation(9000)
     for n in ns:
         for rep in range(reps):
-            yield n, rep, order[start:start + n]
-            start += n
+            yield n, rep, order[support_offset(n, rep):support_offset(n, rep) + n]
+
+
+def suffix(a):
+    return (f"_shift{a.coord_shift:g}" if a.coord_shift else "") + (f"_seed{a.seed}" if a.seed else "")
+
+
+def ft_dir(a, H):
+    return Path(a.out) / f"ft_h{H}{suffix(a)}"
 
 
 def stage_ft(a):
     for H in a.holdout:
-        d = load_subject(a, H)
+        d = load_subject(a, H, a.coord_shift)
         test = take(d, "common", np.arange(1000))
         for n, rep, idx in support_sets(a.ns, a.reps):
-            n_val = max(round(0.2 * n), 5)
             sup = take(d, "unique", idx)
-            trn, val = tuple(x[:n - n_val] for x in sup), tuple(x[n - n_val:] for x in sup)
+            if n < 25:      # 1 / 2 / 4 val images give no usable per-voxel Pearson (user 2026-09-27): all n images, --fixed_epochs epochs
+                n_val, trn, val, epochs = 0, sup, None, a.fixed_epochs
+            else:
+                n_val, epochs = max(round(0.2 * n), 5), a.ft_epochs
+                trn, val = tuple(x[:n - n_val] for x in sup), tuple(x[n - n_val:] for x in sup)
             for b in TRAIN[H]:
-                out = Path(a.out) / f"ft_h{H}" / f"n{n}_rep{rep}_src{b}"
+                out = ft_dir(a, H) / f"n{n}_rep{rep}_src{b}"
                 if (out / "done.json").exists():
                     continue
                 out.mkdir(parents=True, exist_ok=True)
@@ -216,13 +237,40 @@ def stage_ft(a):
                 merger, mlp, embed = build()
                 ck = torch.load(Path(a.out) / f"base_s{b}" / "best.pt", map_location=DEV)
                 mlp.load_state_dict(ck["mlp"]), merger.load_state_dict(ck["merger"])
-                if n == a.ns[0] and rep == 0:                                              # un-finetuned source model
+                if n == a.ns[0] and rep == 0 and not (out.parent / f"zeroshot_src{b}_test.npy").exists():   # un-finetuned source model
                     np.save(out.parent / f"zeroshot_src{b}_test.npy", predict(merger, mlp, embed, test[0], test[1], d["coords"]).half().cpu().numpy())
-                best, ep = fit(a, merger, mlp, embed, d["coords"], trn, val, out, a.ft_epochs, f"h{H}_n{n}_r{rep}_src{b}")
+                best, ep = fit(a, merger, mlp, embed, d["coords"], trn, val, out, epochs, f"h{H}_n{n}_r{rep}_src{b}")
                 np.save(out / "pred_support.npy", predict(merger, mlp, embed, sup[0], sup[1], d["coords"]).half().cpu().numpy())
                 np.save(out / "pred_test.npy", predict(merger, mlp, embed, test[0], test[1], d["coords"]).half().cpu().numpy())
                 (out / "best.pt").unlink()
                 (out / "done.json").write_text(json.dumps(dict(val_corr=best, best_epoch=ep, n_train=n - n_val, n_val=n_val)))
+
+
+def stage_scratch(a):
+    """paper_plan.md §8.2 NRF scratch: one NRF from random initialisation (seed --seed) per support set, trained on the support
+    only with the finetuning recipe of stage ft (same 80 / 20 split and early stopping, at most --ft_epochs epochs, the budget
+    of a finetune), except that early stopping waits --scratch_warmup epochs; test prediction in
+    ft_h<H>/scratch_n<n>_rep<rep>/pred_test.npy."""
+    for H in a.holdout:
+        d = load_subject(a, H)
+        test = take(d, "common", np.arange(1000))
+        for n, rep, idx in support_sets(a.ns, a.reps):
+            out = Path(a.out) / f"ft_h{H}" / f"scratch_n{n}_rep{rep}"
+            if (out / "done.json").exists():
+                continue
+            n_val = max(round(0.2 * n), 5 if n >= 25 else 1)
+            sup = take(d, "unique", idx)
+            trn, val = tuple(x[:n - n_val] for x in sup), tuple(x[n - n_val:] for x in sup)
+            out.mkdir(parents=True, exist_ok=True)
+            t0 = time.time()
+            torch.manual_seed(a.seed)
+            merger, mlp, embed = build()
+            best, ep = fit(a, merger, mlp, embed, d["coords"], trn, val, out, a.ft_epochs, f"h{H}_scratch_n{n}_r{rep}",
+                           min_epochs=a.scratch_warmup)
+            np.save(out / "pred_test.npy", predict(merger, mlp, embed, test[0], test[1], d["coords"]).half().cpu().numpy())
+            (out / "best.pt").unlink()
+            (out / "done.json").write_text(json.dumps(dict(val_corr=best, best_epoch=ep, n_train=n - n_val, n_val=n_val)))
+            print(f"[nrf] scratch h{H} n{n}_r{rep}: val r {best:.4f} at epoch {ep} ({time.time() - t0:.0f}s)", flush=True)
 
 
 def stage_table(a):
@@ -237,15 +285,15 @@ def stage_table(a):
         def score(method, n, rep, pred):
             ev = 1 - (y - pred).var(0, correction=0) / y.var(0, correction=0)
             r = pearson_cols(pred, y)
-            np.save(Path(a.out) / f"ft_h{H}" / f"{method}_n{n}_rep{rep}_expl_var.npy", ev.cpu().numpy())
+            np.save(ft_dir(a, H) / f"{method}_n{n}_rep{rep}_expl_var.npy", ev.cpu().numpy())
             rows.append(dict(holdout=H, method=method, n=n, rep=rep, ev=ev[good].mean().item(), pearson=r[good].mean().item(),
                              median_pearson_all=r.median().item()))
 
-        zs = [Path(a.out) / f"ft_h{H}" / f"zeroshot_src{b}_test.npy" for b in TRAIN[H]]
+        zs = [ft_dir(a, H) / f"zeroshot_src{b}_test.npy" for b in TRAIN[H]]
         if all(p.exists() for p in zs):
             score("nrf_zeroshot_avg", 0, 0, torch.stack([torch.from_numpy(np.load(p)).float().to(DEV) for p in zs]).mean(0))
         for n, rep, idx in support_sets(a.ns, a.reps):
-            dirs = [Path(a.out) / f"ft_h{H}" / f"n{n}_rep{rep}_src{b}" for b in TRAIN[H]]
+            dirs = [ft_dir(a, H) / f"n{n}_rep{rep}_src{b}" for b in TRAIN[H]]
             if not all((p / "done.json").exists() for p in dirs):
                 continue
             ys = torch.from_numpy(np.ascontiguousarray(uniq[np.sort(idx)])[np.argsort(np.argsort(idx))]).to(DEV)
@@ -260,14 +308,14 @@ def stage_table(a):
             for b, p in zip(TRAIN[H], pt):
                 score(f"nrf_ft_src{b}", n, rep, p)
     df = pd.DataFrame(rows)
-    df.to_csv(Path(a.out) / "results.csv", index=False)
+    df.to_csv(Path(a.out) / (f"results{suffix(a)}.csv"), index=False)
     pd.set_option("display.width", 200)
     print(df.groupby(["holdout", "method", "n"])[["ev", "pearson", "median_pearson_all"]].mean().round(4).to_string())
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["feats", "base", "ft", "table"])
+    ap.add_argument("stage", choices=["feats", "base", "ft", "scratch", "table"])
     ap.add_argument("--root", default="data/braincorl_nsdgeneral")
     ap.add_argument("--stimuli", default="data/nrf/stimuli")
     ap.add_argument("--feats", default="data/nrf/feats")
@@ -279,17 +327,21 @@ def main():
     ap.add_argument("--lr", type=float, default=CFG["training"]["learning_rate"])
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--ft_epochs", type=int, default=50)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--scratch_warmup", type=int, default=20, help="stage scratch: no early stop before this epoch (from random init the loss is flat for the first ~5 epochs; user 2026-09-28)")
+    ap.add_argument("--fixed_epochs", type=int, default=24, help="stage ft, n < 25: epochs without a val split (median best_epoch + 1 of the n = 30 finetunes)")
+    ap.add_argument("--seed", type=int, default=0, help="stages ft, table: a nonzero seed writes ft_h<H>[_shift<mm>]_seed<s>, results[_shift<mm>]_seed<s>.csv")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no_tf32", action="store_true")
     ap.add_argument("--micro", type=int, default=0, help="images per micro-batch (0 = whole batch); same gradient, less GPU memory")
+    ap.add_argument("--coord_shift", type=float, default=0.0, help="stages ft, table (E3 ablation): mm added to the x coordinate of "
+                    "every hold-out voxel, as scripts/sflm_fast_cont.py; outputs in ft_h<H>_shift<mm>, results_shift<mm>.csv")
     ap.add_argument("--cpu", action="store_true", help="table stage on the CPU (GPU shared with another job)")
     a = ap.parse_args()
     if a.cpu:
         global DEV
         DEV = torch.device("cpu")
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = not a.no_tf32
-    {"feats": stage_feats, "base": stage_base, "ft": stage_ft, "table": stage_table}[a.stage](a)
+    {"feats": stage_feats, "base": stage_base, "ft": stage_ft, "scratch": stage_scratch, "table": stage_table}[a.stage](a)
 
 
 if __name__ == "__main__":

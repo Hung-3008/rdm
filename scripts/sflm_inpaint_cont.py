@@ -31,32 +31,12 @@ import torch
 
 sys.path.insert(0, ".")
 from src.sflm.fast import support_offset  # noqa: E402
-from src.sflm.fast_cont import EBcont, eb_fit_mackay_cont  # noqa: E402
+from src.sflm.fast_cont import EBcont, eb_fit_mackay_cont, prior_predict  # noqa: E402
 from src.sflm.latent import DATA, DEV, STREAMS  # noqa: E402
 from src.utils.metrics import explained_variance  # noqa: E402
 
 H_GRID = (2.0, 3.0, 5.0, 7.0, 10.0, 14.0)
 DIST_BINS = (0.0, 2.5, 5.0, 7.5, 10.0, 15.0, 1e9)
-
-
-@torch.inference_mode()
-def prior_prediction(pop, xyz_v, sigma, Z_q, jchunk=256):
-    """(V, Q) M0 prediction: posterior at n = 0, responsibilities = prior w_vj, coefficients = C_j."""
-    xyz_p, pn, xv2 = pop["xyz"], (pop["xyz"] ** 2).sum(1), (xyz_v ** 2).sum(1, keepdim=True)
-    J, P, K = pop["A"].shape[0], pop["A"].shape[1], pop["C"].shape[1]
-    logZ = torch.full((xyz_v.shape[0],), -float("inf"), device=DEV)
-    for a in range(0, J, jchunk):
-        lw = -0.5 * (xv2 - 2 * xyz_v @ xyz_p[a:a + jchunk].T + pn[a:a + jchunk][None]) / sigma ** 2
-        logZ = torch.logaddexp(logZ, torch.logsumexp(lw, 1))
-    W = torch.zeros(xyz_v.shape[0], P * K, device=DEV)
-    off = torch.zeros(xyz_v.shape[0], device=DEV)
-    for a in range(0, J, jchunk):
-        sl = slice(a, a + jchunk)
-        w = torch.exp(-0.5 * (xv2 - 2 * xyz_v @ xyz_p[sl].T + pn[sl][None]) / sigma ** 2 - logZ[:, None])  # (V, Jc)
-        cs = pop["C"][sl] / pop["std"][sl]                                                                  # (Jc, K)
-        W += w @ torch.einsum("jp,jk->jpk", pop["A"][sl], cs).reshape(-1, P * K)
-        off += w @ (pop["mean"][sl] * cs).sum(1)
-    return (Z_q.reshape(Z_q.shape[0], -1) @ W.T).T - off[:, None]
 
 
 def fit_covariance(D, xyz, rng, n_anchor=3000, dmax=40.0, width=1.0):
@@ -101,10 +81,11 @@ def rho_fn(cv, d):
 
 
 @torch.inference_mode()
-def predict_masked(P_own, P0, xyz, U, T, cv, k=64, tchunk=1024):
-    """Predictions (|T|, Q) at target voxels T from unmasked voxels U for every method; plus distance to the nearest U."""
+def predict_masked(P_own, P0, xyz, U, T, cv, k=64, tchunk=1024, with_var=False):
+    """Predictions (|T|, Q) at target voxels T from unmasked voxels U for every method; plus distance to the nearest U.
+    with_var: also out["KRIG_var"] (|T|,), the simple-kriging variance a + b + nugget - lambda' c of the deviation D_t."""
     xu, D_u, Pu = xyz[U], (P_own - P0)[U], P_own[U]
-    out = {m: [] for m in ["NN", "KRIG"] + [f"KA_{h:g}" for h in H_GRID] + [f"KAD_{h:g}" for h in H_GRID]}
+    out = {m: [] for m in ["NN", "KRIG"] + [f"KA_{h:g}" for h in H_GRID] + [f"KAD_{h:g}" for h in H_GRID] + (["KRIG_var"] if with_var else [])}
     dnn = []
     for a in range(0, len(T), tchunk):
         t = T[a:a + tchunk]
@@ -122,6 +103,8 @@ def predict_masked(P_own, P0, xyz, U, T, cv, k=64, tchunk=1024):
         ck = cv["a"] * rho_fn(cv, dk) + cv["b"]
         lam = torch.linalg.solve(Ckk, ck[:, :, None])[:, :, 0]                           # (Tc, k)
         out["KRIG"].append(P0[t] + torch.einsum("tk,tkq->tq", lam, D_u[ik]))
+        if with_var:
+            out["KRIG_var"].append(cv["a"] + cv["b"] + cv["nugget"] - (lam * ck).sum(1))
     return {m: torch.cat(v) for m, v in out.items()}, torch.cat(dnn)
 
 
@@ -169,7 +152,7 @@ def main():
     Z_u, Z_q = cache["Z_u"].to(DEV), cache["Z_q"].to(DEV)
     order = np.random.default_rng(100).permutation(B_u.shape[0])
     t0 = time.time()
-    P0 = prior_prediction(pop, xyz, a.sigma_mm, Z_q)
+    P0 = prior_predict(pop, xyz, a.sigma_mm, Z_q)
     P0 = P0 - P0.mean(1, keepdim=True)
     ev0 = explained_variance(P0, true).cpu().numpy()
     log(f"[M0] fold {H}: E0 (all good voxels) {ev0[good].mean():.4f} in {time.time() - t0:.0f}s")
