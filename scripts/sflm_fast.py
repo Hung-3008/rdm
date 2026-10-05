@@ -43,7 +43,7 @@ from scipy.optimize import brentq
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "scripts")
-sys.path.insert(0, "docs/popeb_v2/code")
+sys.path.insert(0, "docs/_archive/popeb_v2/code")
 from lowrank_basis import popeb  # noqa: E402
 from src.sflm.fast import (DF_FLOOR, N_ALL, REPS_ALL, SIG2_FLOOR, TRAIN, EB, _sig2_step, build_cache, eb_fit_mackay,  # noqa: E402
                           fit_alpha, kernel_average, kernel_sums, population, ridge_fixed, support_offset)

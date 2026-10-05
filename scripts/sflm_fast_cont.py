@@ -3,7 +3,7 @@ results.csv format as scripts/sflm_fast.py so scripts/sflm_eb_table.py / sflm_st
 
     python scripts/sflm_fast_cont.py --holdout 1 --out outputs/sflm_ab/h1 --tag A_cont --num_ic 30 100 --reps 0
 n = 0 in --num_ic: the population prior of the hold-out subject (src.sflm.fast_cont.prior_predict at --sigma_mm), rep 0 only.
-Coordinate ablations (docs/experiment_plan_2026-09-26.md E3): --sigma_mm 1e6 (uniform kernel = no coordinates), --coord_mode
+Coordinate ablations (docs/paper/experiment_plan_2026-09-26.md E3): --sigma_mm 1e6 (uniform kernel = no coordinates), --coord_mode
 shuffle, --coord_shift <mm>.
 """
 

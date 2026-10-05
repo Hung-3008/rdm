@@ -1,12 +1,12 @@
 """Shared functional latent map (SFLM) pilot, docs/proposal-shared-functional-latent-2026-09-20.md step 2.
 
 Slow stage (training subjects, unique images only, 8,400 train / 600 val per subject, seed 0 as in
-docs/popeb_v2/code/train_lowrank.py):
+docs/_archive/popeb_v2/code/train_lowrank.py):
     latent map      z_p(x) = W2 SiLU(W1 phi_p(x) + b1) in R^K for each of the 49 cells of the 7x7 CLIP grid
     source readout  beta_v(x) = c_v' sum_m softmax(l_v)_m u_m(x) + b_v,   u_m(x) = sum_p A[m, p] z_p(x)
                     A = dictionary of M isotropic Gaussian masks over the grid (+ one uniform mask)
 Fast stage (held-out subject, closed form, n support pairs + MNI coordinates only):
-    for every mask m: PopEB (docs/popeb_v2/code/lowrank_basis.py, unchanged) in the K pooled channels u_m
+    for every mask m: PopEB (docs/_archive/popeb_v2/code/lowrank_basis.py, unchanged) in the K pooled channels u_m
     mask posterior  q_vm ∝ pi_vm * sig2_vm^(-n/2)   sig2 = leave-one-out MSE of the lam0 ridge,
                     pi = MNI-kernel average of the training voxels' full-data mask posteriors
     prediction      sum_m q_vm pred_vm
@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F_
 
 sys.path.insert(0, ".")
-sys.path.insert(0, "docs/popeb_v2/code")
+sys.path.insert(0, "docs/_archive/popeb_v2/code")
 from lowrank_basis import FunctionalBasis, SubjectHeads, feature_stats, full_coefficients, popeb  # noqa: E402
 from src.sflm.fast import kernel_average, ridge_fixed  # noqa: E402
 from src.sflm.latent import DATA, DEV, STREAMS, GridStore, mask_dictionary, split_8400_600, train_latent  # noqa: E402

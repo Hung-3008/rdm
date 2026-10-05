@@ -226,7 +226,7 @@ class EBcont:
 
     @torch.inference_mode()
     def predict_var(self, tau2, sig2, jsmall=16):
-        """(V, Q) posterior predictive variance with the responsibilities of the last E-step (docs/experiment_plan_2026-09-26.md
+        """(V, Q) posterior predictive variance with the responsibilities of the last E-step (docs/paper/experiment_plan_2026-09-26.md
         E4): sum_j r_vj [f_j(x)' Sigma_vj f_j(x) + (m_vj(x) - m_v(x))^2] + sig2_v + sig2_v / n, with Sigma_vj = sig2_v Q_j
         diag(1 / (d_j + rho_v)) Q_j' the posterior covariance of the coefficients under candidate j, f_j(x) the standardised query
         channels, m_vj(x) = f_j(x)' mu_vj; the last term is the variance of the support mean added back to the prediction."""
